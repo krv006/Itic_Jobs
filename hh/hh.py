@@ -1,6 +1,6 @@
+import os
 import datetime
 import json
-import os
 import time
 
 import pyodbc
@@ -18,8 +18,7 @@ def save_to_database(job_id, job_title, location, skills, salary, education, job
             f"Driver={os.getenv('DB_DRIVER')};"
             f"Server={os.getenv('DB_SERVER')};"
             f"Database={os.getenv('DB_NAME')};"
-            f"Encrypt={os.getenv('DB_ENCRYPT')};"
-            f"TrustServerCertificate={os.getenv('DB_TRUST_SERVER_CERTIFICATE')};"
+            f"Trusted_Connection={os.getenv('DB_TRUSTED_CONNECTION')};"
         )
 
         cursor = conn.cursor()

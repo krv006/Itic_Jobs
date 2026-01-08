@@ -46,19 +46,11 @@ pip install -r requirements.txt
 #### .env settings
 ```text
 DB_DRIVER={ODBC Driver 17 for SQL Server}
-DB_SERVER=YOUR_SERVER
-DB_NAME=YOUR_DB_NAME
+DB_SERVER=
+DB_NAME=
 
 # Windows Authentication
 DB_TRUSTED_CONNECTION=yes
-
-# Security
-DB_ENCRYPT=yes
-DB_TRUST_SERVER_CERTIFICATE=yes
-
-
-DB_USER=if u have
-DB_PASSWORD=if u have
 ```
 
 ---
