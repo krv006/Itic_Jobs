@@ -148,6 +148,7 @@ def main():
 if __name__ == "__main__":
     main()
 
+# TODO: Create a table for HH data in SSMS (DBO)
 """
 CREATE TABLE [dbo].[hh](
   [job_id] [nvarchar](100) NOT NULL,
@@ -171,3 +172,5 @@ PRIMARY KEY CLUSTERED
 GO
 
 """
+
+# TODO: Add SSMS (DBO) connection to conn.json
