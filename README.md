@@ -65,7 +65,7 @@ schema used across the project.
 
 ---
 
-### Module Structure
+### Module Structure HH
 
 ```text
 Itic_Jobs/
@@ -73,16 +73,6 @@ Itic_Jobs/
 ├── hh/
 │   └── hh.py        # HH.uz scraping logic
 ```
-
----
-
-### Source Identifier
-
-```text
-source = "hh"
-```
-
----
 
 ### Database Table (HH)
 
@@ -108,14 +98,51 @@ PRIMARY KEY CLUSTERED
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
 ```
-
 ---
 
-### Run HH Scraper
+## IT-Market (Uzbekistan)
 
-```bash
-python hh/hh.py
+The **IT-Market module** is responsible for scraping job vacancies from  
+**it-market.uz/job (IT-Market Uzbekistan)**.
+
+It is implemented as an independent scraper and follows the common database
+schema used across the project.
+---
+
+### Module Structure IT
+
+```text
+Itic_Jobs/
+│
+├── it_market/
+│   └── it_park_job.py        # it-market.uz scraping logic
 ```
+
+### Database Table (IT Park)
+
+```sql
+CREATE TABLE [dbo].[it_park ](
+  [job_id] [nvarchar](100) NOT NULL,
+  [job_title] [nvarchar](100) NULL,
+  [location] [nvarchar](100) NULL,
+  [skills] [nvarchar](max) NULL,
+  [salary] [nvarchar](max) NULL,
+  [education] [nvarchar](100) NULL,
+  [job_type] [nvarchar](50) NULL,
+  [company_name] [nvarchar](100) NULL,
+  [job_url] [nvarchar](200) NULL,
+  [source] [nvarchar](20) NULL,
+  [description] [nvarchar](max) NULL,
+  [job_subtitle] [nvarchar](250) NULL,
+[posted_date] DATE NOT NULL, 
+PRIMARY KEY CLUSTERED 
+(
+  [job_id] ASC
+)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
+GO
+```
+
 
 ---
 
