@@ -118,7 +118,7 @@ Itic_Jobs/
 │   └── it_park_job.py        # it-market.uz scraping logic
 ```
 
-### Database Table (IT Park)
+### Database Table IT Park
 
 ```sql
 CREATE TABLE [dbo].[it_park ](
@@ -141,6 +141,39 @@ PRIMARY KEY CLUSTERED
 )WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
+```
+
+## Glassdoor (International)
+
+The **Glassdoor module** is responsible for scraping job vacancies from  
+**glassdoor.com (Global IT job market and company reviews)**.
+
+
+### Module Structure Glassdoor
+
+```text
+Itic_Jobs/
+│
+├── glassdoor/
+│   └── glassdoor_main.py        # it-market.uz scraping logic
+```
+
+### Database Table Glassdoor
+
+```sql
+CREATE TABLE dbo.Glassdoor (
+    id INT IDENTITY(1,1) PRIMARY KEY,
+    job_hash CHAR(32) NOT NULL UNIQUE,
+    title NVARCHAR(500),
+    company NVARCHAR(255),
+    location NVARCHAR(255),
+    location_sub NVARCHAR(100),
+    title_sub NVARCHAR(100),
+    skills NVARCHAR(MAX),
+    salary NVARCHAR(255),
+    [date] DATE,
+    created_at DATETIME DEFAULT GETDATE()
+);
 ```
 
 
