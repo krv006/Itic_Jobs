@@ -1,36 +1,49 @@
 import datetime
 import json
+import os
 import time
 
 import pyodbc
 import undetected_chromedriver as uc
+from dotenv import load_dotenv
 from selenium.webdriver.common.by import By
 
+load_dotenv()
 
-def save_to_database(job_id, job_title, location, skills, salary, education, job_type, company_name, job_url, source,
-                     posted_date, job_subtitle):
+
+def save_to_database(job_id, job_title, location, skills, salary, education, job_type,
+                     company_name, job_url, source, posted_date, job_subtitle):
     try:
-        with open("conn.json") as file:
-            conn_dt = json.load(file)
         conn = pyodbc.connect(
-            f"Driver={conn_dt['driver']};"
-            f"Server={conn_dt['server']};"
-            f"Database={conn_dt['db_name']};"
-            "Trusted_Connection=yes;"
+            f"Driver={os.getenv('DB_DRIVER')};"
+            f"Server={os.getenv('DB_SERVER')};"
+            f"Database={os.getenv('DB_NAME')};"
+            f"Encrypt={os.getenv('DB_ENCRYPT')};"
+            f"TrustServerCertificate={os.getenv('DB_TRUST_SERVER_CERTIFICATE')};"
         )
+
         cursor = conn.cursor()
+
         insert_query = """
         INSERT INTO hh (
-            job_id, job_title, location, skills, salary, education, job_type, company_name, job_url, source,posted_date,job_subtitle
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?)
+            job_id, job_title, location, skills, salary,
+            education, job_type, company_name, job_url,
+            source, posted_date, job_subtitle
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
+
         cursor.execute(insert_query, (
-            job_id, job_title, location, skills, salary, education, job_type, company_name, job_url, source,
-            posted_date, job_subtitle))
+            job_id, job_title, location, skills, salary,
+            education, job_type, company_name,
+            job_url, source, posted_date, job_subtitle
+        ))
+
         conn.commit()
         print(f"Saved job {job_id} to database.")
+
     except Exception as e:
         print(f"Error saving to database: {e}")
+
     finally:
         if 'conn' in locals():
             conn.close()
@@ -57,7 +70,7 @@ def get_hh_vacancies(jobs_list):
         while shart:
             job = jobs_list[job_ind]
             driver.get(
-                f"https://samarkand.hh.uz/search/vacancy?text={job}&page={page}&hhtmFrom=main&hhtmFromLabel=vacancy_search_line")
+                f"https://tashkent.hh.uz/search/vacancy?text={job}&page={page}&hhtmFrom=main&hhtmFromLabel=vacancy_search_line")
             job_elements = driver.find_elements(By.XPATH,
                                                 "//div[@class='magritte-redesign']//h2[@data-qa='bloko-header-2']//a[contains(@class,'magritte-link')]")
             job_urls = [job_element.get_attribute("href") for job_element in job_elements]
