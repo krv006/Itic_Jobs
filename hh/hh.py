@@ -7,8 +7,6 @@ import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 
 
-# import pandas as pd
-
 def save_to_database(job_id, job_title, location, skills, salary, education, job_type, company_name, job_url, source,
                      posted_date, job_subtitle):
     try:
@@ -174,4 +172,3 @@ GO
 """
 
 # TODO: Add SSMS (DBO) connection to conn.json
-
