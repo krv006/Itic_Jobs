@@ -271,58 +271,81 @@ def login_google(driver) -> bool:
     return True
 
 
-# ----------------------------
-# Read job details from right panel
-# ----------------------------
 def read_job_details_from_right_panel(driver):
     time.sleep(0.6)
 
-    # company
+    # Right panel root (scoped search)
+    panel = first_existing(driver, [
+        (By.ID, "jobsearch-ViewjobPaneWrapper"),
+        (By.CSS_SELECTOR, "div#jobsearch-ViewjobPaneWrapper"),
+        (By.CSS_SELECTOR, "div.jobsearch-RightPane"),
+        (By.CSS_SELECTOR, "div.jobsearch-JobComponent"),
+    ], timeout=3) or driver
+
+    # ---------------- salary (FIX) ----------------
+    salary = ""
+
+    # 1) New UI: Job details -> Pay -> value (pill)
+    pay_value = first_existing(panel, [
+        # Pay labeldan keyingi birinchi qiymat (span/div)
+        (By.XPATH, ".//*[normalize-space()='Pay']/following::*[self::span or self::div][1]"),
+        # Ba'zan pill ichida bo'ladi
+        (By.XPATH, ".//*[normalize-space()='Pay']/following::*[contains(@class,'css')][1]"),
+    ], timeout=2)
+
+    if pay_value:
+        salary = get_text_safe(pay_value)
+
+    # 2) Fallback: header line "$40,000 a year - Full-time, Contract"
+    if not salary:
+        header_pay = first_existing(panel, [
+            (By.XPATH, ".//*[contains(.,'$') and contains(.,'a year')]"),
+            (By.XPATH, ".//*[contains(.,'$') and contains(.,'an hour')]"),
+        ], timeout=1)
+        if header_pay:
+            txt = get_text_safe(header_pay)
+            # faqat pay qismini ajratib olish (xohlasang)
+            salary = txt.split(" - ")[0].strip()
+
+    # ---------------- company ----------------
     company = ""
-    el = first_existing(driver, [
+    el = first_existing(panel, [
         (By.CSS_SELECTOR, "[data-testid='inlineHeader-companyName']"),
-        (By.XPATH, "//*[@data-testid='inlineHeader-companyName']"),
-    ], timeout=3)
+        (By.XPATH, ".//*[@data-testid='inlineHeader-companyName']"),
+    ], timeout=2)
     if el:
         company = get_text_safe(el)
 
-    # location
+    # ---------------- location ----------------
     location = ""
-    el = first_existing(driver, [
+    el = first_existing(panel, [
         (By.CSS_SELECTOR, "[data-testid='inlineHeader-companyLocation']"),
-        (By.XPATH, "//*[@data-testid='inlineHeader-companyLocation']"),
-    ], timeout=3)
+        (By.XPATH, ".//*[@data-testid='inlineHeader-companyLocation']"),
+    ], timeout=2)
     if el:
         location = get_text_safe(el)
 
-    # salary
-    salary = ""
-    pay_el = first_existing(driver, [
-        (By.XPATH, "//*[contains(@aria-label,'Pay') or contains(@aria-label,'Salary')]"),
-    ], timeout=2)
-    if pay_el:
-        salary = get_text_safe(pay_el).replace("Pay", "").strip()
-
-    # job type
+    # ---------------- job type ----------------
     job_type = ""
-    jt_el = first_existing(driver, [
-        (By.XPATH, "//*[contains(@aria-label,'Job type')]"),
+    jt = first_existing(panel, [
+        (By.XPATH, ".//*[normalize-space()='Job type']/following::*[self::span or self::div][1]"),
+        (By.XPATH, ".//*[contains(@aria-label,'Job type')]"),
     ], timeout=2)
-    if jt_el:
-        job_type = get_text_safe(jt_el).replace("Job type", "").strip()
+    if jt:
+        job_type = get_text_safe(jt).replace("Job type", "").strip()
 
-    # skills
+    # ---------------- skills ----------------
     skills = ""
-    btn_more = first_existing(driver, [
-        (By.XPATH, "//button[contains(., 'show more') or contains(., '+ show more')]"),
+    btn_more = first_existing(panel, [
+        (By.XPATH, ".//button[contains(., 'show more') or contains(., '+ show more')]"),
     ], timeout=1)
     if btn_more:
         safe_click(driver, btn_more)
         time.sleep(0.3)
 
-    sk_el = first_existing(driver, [
+    sk_el = first_existing(panel, [
         (By.CSS_SELECTOR, "ul.js-match-insights-provider"),
-        (By.XPATH, "//div[contains(@aria-label,'Skills')]//ul"),
+        (By.XPATH, ".//div[contains(@aria-label,'Skills')]//ul"),
     ], timeout=2)
     if sk_el:
         raw = get_text_safe(sk_el)
@@ -335,11 +358,11 @@ def read_job_details_from_right_panel(driver):
         parts = [p for p in parts if p and "Do you have" not in p]
         skills = ",".join(parts)
 
-    # education
+    # ---------------- education ----------------
     education = "No Degree Required"
-    ed_el = first_existing(driver, [
-        (By.XPATH, "//*[@aria-label='Education']"),
-        (By.XPATH, "//*[contains(@aria-label,'Education')]"),
+    ed_el = first_existing(panel, [
+        (By.XPATH, ".//*[@aria-label='Education']"),
+        (By.XPATH, ".//*[contains(@aria-label,'Education')]"),
     ], timeout=2)
     if ed_el:
         raw = get_text_safe(ed_el)
@@ -350,6 +373,7 @@ def read_job_details_from_right_panel(driver):
             education = ",".join(parts)
 
     return company, location, salary, job_type, skills, education
+
 
 
 def get_job_id_from_url(url: str) -> str:
