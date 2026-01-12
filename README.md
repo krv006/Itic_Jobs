@@ -155,7 +155,7 @@ The **Glassdoor module** is responsible for scraping job vacancies from
 Itic_Jobs/
 │
 ├── glassdoor/
-│   └── glassdoor_main.py        # it-market.uz scraping logic
+│   └── glassdoor_main.py        # glassdoor.com scraping logic
 ```
 
 ### Database Table Glassdoor
@@ -175,6 +175,51 @@ CREATE TABLE dbo.Glassdoor (
     created_at DATETIME DEFAULT GETDATE()
 );
 ```
+
+
+## Indeed 
+
+The **Indeed module** is responsible for scraping job vacancies from  
+**indeed.com (Global job market and employment opportunities platform)**.
+
+
+### Module Structure Indeed
+
+```text
+Itic_Jobs/
+│
+├── indeed/
+│   └── main_indeed.py        # indeed.com scraping logic
+```
+
+### Database Table Glassdoor
+
+```sql
+IF OBJECT_ID('dbo.indeed', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.indeed (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        job_id NVARCHAR(100) NOT NULL,
+        source NVARCHAR(50) NOT NULL,
+        job_title NVARCHAR(500) NULL,
+        company_name NVARCHAR(500) NULL,
+        location NVARCHAR(255) NULL,
+        salary NVARCHAR(255) NULL,
+        job_type NVARCHAR(255) NULL,
+        skills NVARCHAR(MAX) NULL,
+        education NVARCHAR(255) NULL,
+        job_url NVARCHAR(1000) NULL,
+        created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+    );
+
+
+    CREATE UNIQUE INDEX UX_indeed_jobid_source
+        ON dbo.indeed (job_id, source);
+END
+GO
+
+```
+
 
 
 ---
