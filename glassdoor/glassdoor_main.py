@@ -19,7 +19,7 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 CONN_PATH = BASE_DIR / "conn.json"
 COOKIES_PATH = BASE_DIR / "cookies.json"
-JOBS_PATH = BASE_DIR / "jobs_list.json"
+JOBS_PATH = BASE_DIR / "job_list.json"
 
 
 # ---------------- HELPERS ----------------

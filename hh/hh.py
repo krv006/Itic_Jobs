@@ -1,184 +1,225 @@
-import os
 import datetime
 import json
-import time
+import os
 
-import pyodbc
+import psycopg2
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
+# ======================
+# LOAD ENV
+# ======================
 load_dotenv()
 
+# ======================
+# DB CONNECTION
+# ======================
+conn = psycopg2.connect(
+    host=os.getenv("DB_HOST"),
+    port=os.getenv("DB_PORT"),
+    dbname=os.getenv("DB_NAME"),
+    user=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD")
+)
+conn.autocommit = True
+cursor = conn.cursor()
 
-def save_to_database(job_id, job_title, location, skills, salary, education, job_type,
-                     company_name, job_url, source, posted_date, job_subtitle):
-    try:
-        conn = pyodbc.connect(
-            f"Driver={os.getenv('DB_DRIVER')};"
-            f"Server={os.getenv('DB_SERVER')};"
-            f"Database={os.getenv('DB_NAME')};"
-            f"Trusted_Connection={os.getenv('DB_TRUSTED_CONNECTION')};"
-        )
 
-        cursor = conn.cursor()
+# ======================
+# CREATE TABLE
+# ======================
+def create_table_if_not_exists():
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS hh (
+            job_id TEXT PRIMARY KEY,
+            job_title TEXT,
+            location TEXT,
+            skills TEXT,
+            salary TEXT,
+            education TEXT,
+            job_type TEXT,
+            company_name TEXT,
+            job_url TEXT,
+            source TEXT,
+            posted_date DATE,
+            job_subtitle TEXT
+        );
+    """)
 
-        insert_query = """
+
+# ======================
+# VALIDATORS
+# ======================
+def is_valid_job_id(job_id: str) -> bool:
+    return job_id.isdigit() and len(job_id) >= 6
+
+
+def is_valid_job_title(title: str) -> bool:
+    if not title or len(title) < 5:
+        return False
+
+    bad_words = (
+        "найдено",
+        "vacancy",
+        "employers",
+        "работодател",
+        "ооо ",
+        "тоо ",
+        "ип ",
+        "ao ",
+        "ltd",
+    )
+
+    title_lower = title.lower()
+    return not any(bad in title_lower for bad in bad_words)
+
+
+# ======================
+# SAVE DATA
+# ======================
+def save_to_database(data: dict):
+    cursor.execute("""
         INSERT INTO hh (
             job_id, job_title, location, skills, salary,
             education, job_type, company_name, job_url,
             source, posted_date, job_subtitle
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (job_id) DO NOTHING;
+    """, (
+        data["job_id"],
+        data["job_title"],
+        data["location"],
+        data["skills"],
+        data["salary"],
+        data["education"],
+        data["job_type"],
+        data["company_name"],
+        data["job_url"],
+        data["source"],
+        data["posted_date"],
+        data["job_subtitle"]
+    ))
 
-        cursor.execute(insert_query, (
-            job_id, job_title, location, skills, salary,
-            education, job_type, company_name,
-            job_url, source, posted_date, job_subtitle
-        ))
 
-        conn.commit()
-        print(f"Saved job {job_id} to database.")
-
-    except Exception as e:
-        print(f"Error saving to database: {e}")
-
-    finally:
-        if 'conn' in locals():
-            conn.close()
-
-
+# ======================
+# CHROME DRIVER
+# ======================
 def create_driver():
     options = uc.ChromeOptions()
-    # options.add_argument("--headless")  # Uncomment if you want headless mode
+
+    if os.getenv("HEADLESS", "false").lower() == "true":
+        options.add_argument("--headless=new")
+
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--start-maximized")
+    options.add_argument("--window-size=1920,1080")
 
-    driver = uc.Chrome(options=options)
-    return driver
+    return uc.Chrome(options=options)
 
 
+# ======================
+# SAFE TEXT
+# ======================
+def safe_text(driver, xpath):
+    try:
+        return driver.find_element(By.XPATH, xpath).text.strip()
+    except NoSuchElementException:
+        return ""
+
+
+# ======================
+# MAIN SCRAPER
+# ======================
 def get_hh_vacancies(jobs_list):
     driver = create_driver()
-    driver1 = create_driver()
-    try:
-        shart = 1
-        page = 0
-        job_ind = 0
-        while shart:
-            job = jobs_list[job_ind]
-            driver.get(
-                f"https://tashkent.hh.uz/search/vacancy?text={job}&page={page}&hhtmFrom=main&hhtmFromLabel=vacancy_search_line")
-            job_elements = driver.find_elements(By.XPATH,
-                                                "//div[@class='magritte-redesign']//h2[@data-qa='bloko-header-2']//a[contains(@class,'magritte-link')]")
-            job_urls = [job_element.get_attribute("href") for job_element in job_elements]
-            if job_urls == []:
-                job_ind += 1
-            else:
-                for job_url in job_urls:
-                    driver1.get(job_url)
-                    time.sleep(2)
-                    try:
-                        title = driver1.find_element(By.XPATH, "//h1[@class='bloko-header-section-1']").text
-                    except:
-                        title = ""
-                    try:
-                        working_hours = driver1.find_element(By.XPATH, "//div[@data-qa='vacancy-working-hours']").text
-                    except:
-                        working_hours = ""
-                    try:
-                        company_name = driver1.find_element(By.XPATH, "//div[@data-qa='vacancy-company__details']").text
-                    except:
-                        company_name = ""
-                    try:
-                        skills = ",".join(
-                            driver1.find_element(By.XPATH, "//ul[contains(@class,'vacancy-skill-list')]").text.split(
-                                "\n"))
-                    except:
-                        skills = ""
-                    try:
-                        salary = driver1.find_element(By.XPATH, "//span[contains(@data-qa,'vacancy-salary')]").text
-                    except:
-                        salary = ""
-                    try:
-                        working_schedule = driver1.find_element(By.XPATH,
-                                                                "//p[@data-qa='work-schedule-by-days-text']").text
-                    except:
-                        working_schedule = ""
-                    try:
-                        work_format = driver1.find_element(By.XPATH, "//span[@data-qa='work-formats-text']").text
-                    except:
-                        work_format = ""
-                    try:
-                        location = driver1.find_element(By.XPATH,
-                                                        "//span[@data-qa='vacancy-view-raw-address']").text.replace(
-                            "\n", "")
-                    except:
-                        location = ""
-                    try:
-                        posted_date = datetime.datetime.strptime(
-                            driver1.find_element(By.XPATH, "//p[@data-qa='vacancy-creation-time']/span").text.replace(
-                                "on", "").strip(), "%B %d, %Y")
-                    except:
-                        posted_date = datetime.datetime.now()
-                    try:
-                        job_id = driver1.current_url.split("?")[0].split("/")[-1]
-                        save_to_database(
-                            job_id=int(job_id),
-                            job_title=title,
-                            location=location,
-                            skills=skills,
-                            salary=salary,
-                            education="",
-                            job_type=working_hours,
-                            company_name=company_name,
-                            job_url=job_url,
-                            source="hh.uz",
-                            posted_date=posted_date.strftime("%Y-%m-%d"),
-                            job_subtitle=job
-                        )
-                    except:
-                        continue
-                page += 1
+    wait = WebDriverWait(driver, 20)
 
+    try:
+        for job in jobs_list:
+            page = 0
+
+            while True:
+                search_url = (
+                    f"https://tashkent.hh.uz/search/vacancy"
+                    f"?text={job}&page={page}"
+                )
+                driver.get(search_url)
+
+                try:
+                    job_links = wait.until(
+                        EC.presence_of_all_elements_located(
+                            (By.XPATH, "//a[contains(@class,'magritte-link')]")
+                        )
+                    )
+                except TimeoutException:
+                    break
+
+                urls = [
+                    a.get_attribute("href")
+                    for a in job_links
+                    if a.get_attribute("href")
+                ]
+
+                if not urls:
+                    break
+
+                for url in urls:
+                    if not isinstance(url, str):
+                        continue
+
+                    driver.get(url)
+
+                    job_id = url.split("?")[0].split("/")[-1]
+                    if not is_valid_job_id(job_id):
+                        continue
+
+                    job_title = safe_text(driver, "//h1")
+                    if not is_valid_job_title(job_title):
+                        continue
+
+                    data = {
+                        "job_id": job_id,
+                        "job_title": job_title,
+                        "location": safe_text(driver, "//span[@data-qa='vacancy-view-raw-address']"),
+                        "skills": safe_text(driver, "//ul[contains(@class,'vacancy-skill-list')]").replace("\n", ","),
+                        "salary": safe_text(driver, "//span[contains(@data-qa,'vacancy-salary')]"),
+                        "education": "",
+                        "job_type": safe_text(driver, "//div[@data-qa='vacancy-working-hours']"),
+                        "company_name": safe_text(driver, "//div[@data-qa='vacancy-company__details']"),
+                        "job_url": url,
+                        "source": "hh.uz",
+                        "posted_date": datetime.date.today(),
+                        "job_subtitle": job
+                    }
+
+                    save_to_database(data)
+                    print(f"SAVED: {job_id}")
+
+                page += 1
 
     finally:
         driver.quit()
-        driver1.quit()
+        cursor.close()
+        conn.close()
 
 
+# ======================
+# ENTRY POINT
+# ======================
 def main():
-    with open("job_list.json", "r") as file:
-        jobs_list = json.load(file)
-    get_hh_vacancies(jobs_list)
-    print("Vacancies fetched successfully.")
+    create_table_if_not_exists()
+
+    with open("job_list.json", "r", encoding="utf-8") as f:
+        jobs = json.load(f)
+
+    get_hh_vacancies(jobs)
+    print("DONE")
 
 
 if __name__ == "__main__":
     main()
-
-# TODO: Create a table for HH data in SSMS (DBO)
-"""
-CREATE TABLE [dbo].[hh](
-  [job_id] [nvarchar](100) NOT NULL,
-  [job_title] [nvarchar](100) NULL,
-  [location] [nvarchar](100) NULL,
-  [skills] [nvarchar](max) NULL,
-  [salary] [nvarchar](max) NULL,
-  [education] [nvarchar](100) NULL,
-  [job_type] [nvarchar](50) NULL,
-  [company_name] [nvarchar](100) NULL,
-  [job_url] [nvarchar](200) NULL,
-  [source] [nvarchar](20) NULL,
-  [description] [nvarchar](max) NULL,
-  [job_subtitle] [nvarchar](250) NULL,
-[posted_date] DATE NOT NULL, 
-PRIMARY KEY CLUSTERED 
-(
-  [job_id] ASC
-)WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
-) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
-GO
-
-"""
