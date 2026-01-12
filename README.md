@@ -57,6 +57,8 @@ DB_TRUSTED_CONNECTION=yes
 
 ## HH (HeadHunter Uzbekistan)
 
+- [HH.ru](https://tashkent.hh.uz/)
+
 The **HH module** is responsible for scraping job vacancies from  
 **HH.uz (HeadHunter Uzbekistan)**.
 
@@ -102,6 +104,8 @@ GO
 
 ## IT-Market (Uzbekistan)
 
+- [IT-Market](https://it-market.uz/job/)
+
 The **IT-Market module** is responsible for scraping job vacancies from  
 **it-market.uz/job (IT-Market Uzbekistan)**.
 
@@ -145,6 +149,9 @@ GO
 
 ## Glassdoor (International)
 
+- [Glassdoor](https://www.glassdoor.com/)
+
+
 The **Glassdoor module** is responsible for scraping job vacancies from  
 **glassdoor.com (Global IT job market and company reviews)**.
 
@@ -178,6 +185,8 @@ CREATE TABLE dbo.Glassdoor (
 
 
 ## Indeed 
+
+-  [Indeed](https://www.indeed.com)
 
 The **Indeed module** is responsible for scraping job vacancies from  
 **indeed.com (Global job market and employment opportunities platform)**.
