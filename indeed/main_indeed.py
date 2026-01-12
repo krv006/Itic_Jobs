@@ -1,49 +1,27 @@
-"""
-Indeed Scraper (Robust / Production-like)
-- undetected_chromedriver
-- Google login (robust: visibility/clickable + JS fallback)
-- Stable scraping with WebDriverWait
-- Pagination safe
-- DB insert IF NOT EXISTS (no duplicates)
-- Single DB connection for whole run
-
-Requirements:
-pip install -U undetected-chromedriver selenium pyodbc
-
-Files:
-- conn.json         -> {"driver":"ODBC Driver 17 for SQL Server","server":"...","db_name":"itic"}
-- credentials.json  -> {"email":"...","password":"..."}
-- jobs-list.json    -> ["python developer","data engineer", ...]
-"""
-
-import json
+import os
 import time
 import urllib.parse
+
 import pyodbc
 import undetected_chromedriver as uc
-
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
+from dotenv import load_dotenv
 from selenium.common.exceptions import (
     TimeoutException,
     StaleElementReferenceException,
     ElementClickInterceptedException,
     NoSuchWindowException,
 )
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
+load_dotenv()
 
-# ----------------------------
-# Config
-# ----------------------------
 INDEED_HOME = "https://www.indeed.com/"
 DEFAULT_WAIT = 15
 
 
-# ----------------------------
-# Driver
-# ----------------------------
 def create_driver(headless: bool = False, version_main: int | None = None):
     options = uc.ChromeOptions()
     if headless:
@@ -58,11 +36,7 @@ def create_driver(headless: bool = False, version_main: int | None = None):
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 
-    if version_main:
-        driver = uc.Chrome(options=options, version_main=version_main)
-    else:
-        driver = uc.Chrome(options=options)
-
+    driver = uc.Chrome(options=options, version_main=version_main) if version_main else uc.Chrome(options=options)
     driver.set_page_load_timeout(60)
     return driver
 
@@ -71,19 +45,29 @@ def wait(driver, t=DEFAULT_WAIT):
     return WebDriverWait(driver, t)
 
 
-# ----------------------------
-# DB
-# ----------------------------
-def open_db():
-    with open("conn.json", "r", encoding="utf-8") as f:
-        conn_dt = json.load(f)
+def _env_required(key: str) -> str:
+    val = os.getenv(key)
+    if not val:
+        raise RuntimeError(f".env da {key} topilmadi yoki bo‘sh!")
+    return val
 
-    conn = pyodbc.connect(
-        f"Driver={conn_dt['driver']};"
-        f"Server={conn_dt['server']};"
-        f"Database={conn_dt['db_name']};"
-        "Trusted_Connection=yes;"
+
+def open_db():
+    driver = _env_required("DB_DRIVER").strip()
+    server = _env_required("DB_SERVER").strip()
+    db_name = _env_required("DB_NAME").strip()
+    trusted = os.getenv("DB_TRUSTED_CONNECTION", "yes").strip()
+    driver = driver.strip('{}').strip().strip('"').strip("'")
+
+    conn_str = (
+        f"DRIVER={{{driver}}};"
+        f"SERVER={server};"
+        f"DATABASE={db_name};"
+        f"Trusted_Connection={trusted};"
     )
+
+    print("[DB]", conn_str)
+    conn = pyodbc.connect(conn_str)
     conn.autocommit = False
     return conn
 
@@ -146,11 +130,11 @@ def get_text_safe(el):
         return ""
 
 
-def first_existing(driver, selectors, timeout=5):
+def first_existing(driver_or_el, selectors, timeout=5):
     t_end = time.time() + timeout
     while time.time() < t_end:
         for by, sel in selectors:
-            els = driver.find_elements(by, sel)
+            els = driver_or_el.find_elements(by, sel)
             if els:
                 return els[0]
         time.sleep(0.2)
@@ -158,7 +142,7 @@ def first_existing(driver, selectors, timeout=5):
 
 
 # ----------------------------
-# Login (Google) - ROBUST
+# Login (Google) - from .env
 # ----------------------------
 def login_google(driver) -> bool:
     print("Logging into Indeed using Google...")
@@ -168,7 +152,6 @@ def login_google(driver) -> bool:
     except TimeoutException:
         return False
 
-    # Sign in
     sign_in = first_existing(driver, [
         (By.XPATH, "//a[contains(., 'Sign in') or contains(., 'Sign In')]"),
         (By.CSS_SELECTOR, "a[href*='account/login']"),
@@ -181,7 +164,6 @@ def login_google(driver) -> bool:
     safe_click(driver, sign_in)
     time.sleep(2)
 
-    # Google button
     google_btn = first_existing(driver, [
         (By.ID, "login-google-button"),
         (By.CSS_SELECTOR, "[data-testid='google-login-button']"),
@@ -195,13 +177,9 @@ def login_google(driver) -> bool:
     safe_click(driver, google_btn)
     time.sleep(2)
 
-    # creds
-    with open("credentials.json", "r", encoding="utf-8") as f:
-        creds = json.load(f)
-    email = creds["email"]
-    password = creds["password"]
+    email = _env_required("EMAIL")
+    password = _env_required("EMAIL_PASSWORD")
 
-    # switch window if opened
     try:
         wins = driver.window_handles
         if len(wins) > 1:
@@ -210,7 +188,7 @@ def login_google(driver) -> bool:
         print("Google login window not available.")
         return False
 
-    # sometimes account chooser appears
+    # account chooser
     try:
         use_another = driver.find_elements(By.XPATH, "//*[contains(.,'Use another account')]/..")
         if use_another:
@@ -231,13 +209,11 @@ def login_google(driver) -> bool:
         print(f"Google email step failed: {e}")
         return False
 
-    # PASSWORD (VISIBLE + JS CLICK fallback)
+    # PASSWORD (VISIBLE + JS fallback)
     try:
         pwd_inp = wait(driver, 25).until(
             EC.visibility_of_element_located((By.XPATH, "//input[@type='password' or @name='Passwd']"))
         )
-
-        # interactable bo‘lmasa JS click bilan
         try:
             pwd_inp.click()
             pwd_inp.send_keys(password)
@@ -248,7 +224,6 @@ def login_google(driver) -> bool:
         pwd_inp.send_keys(Keys.ENTER)
 
     except Exception as e:
-        # screenshot for debug
         try:
             driver.save_screenshot("google_login_password_error.png")
             print("Saved screenshot: google_login_password_error.png")
@@ -260,7 +235,6 @@ def login_google(driver) -> bool:
 
     time.sleep(3)
 
-    # back to indeed tab if needed
     try:
         if len(driver.window_handles) > 1:
             driver.switch_to.window(driver.window_handles[0])
@@ -271,10 +245,12 @@ def login_google(driver) -> bool:
     return True
 
 
+# ----------------------------
+# Job details
+# ----------------------------
 def read_job_details_from_right_panel(driver):
     time.sleep(0.6)
 
-    # Right panel root (scoped search)
     panel = first_existing(driver, [
         (By.ID, "jobsearch-ViewjobPaneWrapper"),
         (By.CSS_SELECTOR, "div#jobsearch-ViewjobPaneWrapper"),
@@ -282,21 +258,15 @@ def read_job_details_from_right_panel(driver):
         (By.CSS_SELECTOR, "div.jobsearch-JobComponent"),
     ], timeout=3) or driver
 
-    # ---------------- salary (FIX) ----------------
+    # salary
     salary = ""
-
-    # 1) New UI: Job details -> Pay -> value (pill)
     pay_value = first_existing(panel, [
-        # Pay labeldan keyingi birinchi qiymat (span/div)
         (By.XPATH, ".//*[normalize-space()='Pay']/following::*[self::span or self::div][1]"),
-        # Ba'zan pill ichida bo'ladi
         (By.XPATH, ".//*[normalize-space()='Pay']/following::*[contains(@class,'css')][1]"),
     ], timeout=2)
-
     if pay_value:
         salary = get_text_safe(pay_value)
 
-    # 2) Fallback: header line "$40,000 a year - Full-time, Contract"
     if not salary:
         header_pay = first_existing(panel, [
             (By.XPATH, ".//*[contains(.,'$') and contains(.,'a year')]"),
@@ -304,10 +274,9 @@ def read_job_details_from_right_panel(driver):
         ], timeout=1)
         if header_pay:
             txt = get_text_safe(header_pay)
-            # faqat pay qismini ajratib olish (xohlasang)
             salary = txt.split(" - ")[0].strip()
 
-    # ---------------- company ----------------
+    # company
     company = ""
     el = first_existing(panel, [
         (By.CSS_SELECTOR, "[data-testid='inlineHeader-companyName']"),
@@ -316,7 +285,7 @@ def read_job_details_from_right_panel(driver):
     if el:
         company = get_text_safe(el)
 
-    # ---------------- location ----------------
+    # location
     location = ""
     el = first_existing(panel, [
         (By.CSS_SELECTOR, "[data-testid='inlineHeader-companyLocation']"),
@@ -325,7 +294,7 @@ def read_job_details_from_right_panel(driver):
     if el:
         location = get_text_safe(el)
 
-    # ---------------- job type ----------------
+    # job type
     job_type = ""
     jt = first_existing(panel, [
         (By.XPATH, ".//*[normalize-space()='Job type']/following::*[self::span or self::div][1]"),
@@ -334,7 +303,7 @@ def read_job_details_from_right_panel(driver):
     if jt:
         job_type = get_text_safe(jt).replace("Job type", "").strip()
 
-    # ---------------- skills ----------------
+    # skills
     skills = ""
     btn_more = first_existing(panel, [
         (By.XPATH, ".//button[contains(., 'show more') or contains(., '+ show more')]"),
@@ -358,7 +327,7 @@ def read_job_details_from_right_panel(driver):
         parts = [p for p in parts if p and "Do you have" not in p]
         skills = ",".join(parts)
 
-    # ---------------- education ----------------
+    # education
     education = "No Degree Required"
     ed_el = first_existing(panel, [
         (By.XPATH, ".//*[@aria-label='Education']"),
@@ -373,7 +342,6 @@ def read_job_details_from_right_panel(driver):
             education = ",".join(parts)
 
     return company, location, salary, job_type, skills, education
-
 
 
 def get_job_id_from_url(url: str) -> str:
@@ -426,7 +394,6 @@ def scrape_keyword(driver, conn, keyword: str, max_pages: int = 30):
         print("[WARN] Page load timeout.")
         return
 
-    # wait list container
     try:
         wait(driver, 25).until(
             EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'mosaic-provider-jobcards')]"))
@@ -443,7 +410,7 @@ def scrape_keyword(driver, conn, keyword: str, max_pages: int = 30):
         print(f"[PAGE] {page}")
 
         container = driver.find_element(By.XPATH, "//div[contains(@class,'mosaic-provider-jobcards')]")
-        job_cards = container.find_elements(By.XPATH, ".//li")  # ✅ .//li (faqat container ichidagi)
+        job_cards = container.find_elements(By.XPATH, ".//li")
 
         if not job_cards:
             print("[STOP] job cards topilmadi.")
@@ -495,7 +462,7 @@ def scrape_keyword(driver, conn, keyword: str, max_pages: int = 30):
 
                 if saved:
                     total_saved += 1
-                    print(f"  ✅ saved #{total_saved}: {title} | {company} | {location}")
+                    print(f"  ✅ saved #{total_saved}: {title} | {company} | {location} | {salary}")
 
             except StaleElementReferenceException:
                 continue
@@ -526,15 +493,16 @@ def main():
 
     conn = open_db()
 
+    # jobs-list.json shu holicha qoladi (keywordlar)
+    import json
     with open("jobs-list.json", "r", encoding="utf-8") as f:
         keywords = json.load(f)
 
     try:
         for kw in keywords:
             kw = str(kw).strip()
-            if not kw:
-                continue
-            scrape_keyword(driver, conn, kw, max_pages=30)
+            if kw:
+                scrape_keyword(driver, conn, kw, max_pages=30)
     finally:
         try:
             conn.close()
