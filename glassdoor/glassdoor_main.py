@@ -243,10 +243,9 @@ if __name__ == "__main__":
     with open(JOBS_PATH, "r", encoding="utf-8") as f:
         jobs = json.load(f)
 
-    driver = uc.Chrome()
     for job in jobs:
         try:
-            GlassdoorScraper(job, "United States", driver=driver)
+            GlassdoorScraper(job, "United States", driver=None)
         except Exception as e:
             print(f"Scrape error: {e}")
 
