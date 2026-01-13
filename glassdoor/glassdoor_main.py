@@ -6,15 +6,12 @@ import time
 from pathlib import Path
 
 import pyodbc
-
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.chrome.options import Options
-
 
 load_dotenv()
 
@@ -243,13 +240,18 @@ class GlassdoorScraper:
 
 
 if __name__ == "__main__":
-    #with open(JOBS_PATH, "r", encoding="utf-8") as f:
-    #    jobs = json.load(f)
-    jobs = ["data analyst"]
-    for job in jobs:
-        try:
-            GlassdoorScraper(job, "United States")
-        except Exception as e:
-            print(f"Scrape error: {e}")
+    with open(JOBS_PATH, "r", encoding="utf-8") as f:
+        jobs = json.load(f)
 
-    
+    countries_path = BASE_DIR / "countries.json"
+    with open(countries_path, "r", encoding="utf-8") as f:
+        countries = json.load(f)
+
+    for job in jobs:
+        for country in countries:
+            try:
+                print(f"Scraping {job} in {country}...")
+                GlassdoorScraper(job, country)
+            except Exception as e:
+                print(f"Scrape error for {job} in {country}: {e}")
+

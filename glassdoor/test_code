@@ -1,0 +1,267 @@
+import datetime
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
+
+from dotenv import load_dotenv
+from seleniumbase import Driver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+import psycopg2
+
+load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent
+JOBS_PATH = BASE_DIR / "job_list.json"
+COUNTRIES_PATH = BASE_DIR / "countries.json"  # agar mavjud bo'lsa ishlatiladi
+
+# ---------------- HELPERS ----------------
+def job_hash(title, company, location, date_str):
+    raw = f"{(title or '')}|{(company or '')}|{(location or '')}|{date_str or ''}".lower().strip()
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+# ---------------- DATABASE ----------------
+def get_db_connection():
+    return psycopg2.connect(
+        host=os.getenv("DB_HOST", "localhost"),
+        port=os.getenv("DB_PORT", "5433"),
+        database=os.getenv("DB_NAME", "itic"),
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASSWORD", "1")
+    )
+
+def create_table_if_not_exists():
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS glassdoor (
+                job_hash VARCHAR(64) PRIMARY KEY,
+                title TEXT,
+                company TEXT,
+                location TEXT,
+                location_sub TEXT,
+                title_sub TEXT,
+                skills TEXT,
+                salary TEXT,
+                posted_date DATE
+            );
+        """)
+        conn.commit()
+        print("✅ Table 'glassdoor' tayyor yoki mavjud")
+    except Exception as e:
+        print(f"Table yaratish xatosi: {e}")
+    finally:
+        conn.close()
+
+def save_to_database(title, company, location, location_sub, title_sub, skills, salary, posted_date):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        h = job_hash(title, company, location, str(posted_date) if posted_date else "")
+
+        cursor.execute(
+            """
+            INSERT INTO glassdoor (
+                job_hash, title, company, location,
+                location_sub, title_sub, skills, salary, posted_date
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (job_hash) DO NOTHING
+            """,
+            (h, title, company, location, location_sub, title_sub, skills, salary, posted_date)
+        )
+        conn.commit()
+        print(f"✅ Saqlandi → {title} | {company} | {posted_date}")
+    except Exception as e:
+        print(f"DB saqlash xatosi: {e}")
+    finally:
+        conn.close()
+
+# ---------------- SCRAPER CLASS ----------------
+class GlassdoorScraper:
+    def __init__(self, job_title, country_name):
+        self.job = job_title
+        self.country = country_name
+
+        # UC mode bilan driver (Cloudflare bypass)
+        self.driver = Driver(uc=True, headless=False)  # headless=True qilib keyin o'zgartirsa bo'ladi
+        self.wait_long = WebDriverWait(self.driver, 40)
+        self.wait_short = WebDriverWait(self.driver, 10)
+
+        self.scrape_job_search()
+
+    def scrape_job_search(self):
+        print(f"\nScraping boshlandi: {self.job} in {self.country}")
+
+        self.driver.uc_open_with_reconnect("https://www.glassdoor.com/Job/index.htm", reconnect_time=8)
+
+        # CAPTCHA ni avto hal qilishga harakat
+        try:
+            self.driver.uc_gui_click_captcha()
+            time.sleep(5)
+            print("CAPTCHA hal qilindi (agar chiqqan bo'lsa)")
+        except:
+            print("CAPTCHA avto hal qilinmadi yoki yo'q edi")
+
+        time.sleep(4)  # sahifa to'liq yuklanishi uchun
+
+        try:
+            # Job title input - yangi placeholder bilan
+            job_input = self.wait_long.until(EC.visibility_of_element_located((
+                By.CSS_SELECTOR,
+                'input[placeholder*="perfect job" i], '
+                'input[placeholder*="Find perfect job" i], '
+                'input[placeholder*="job" i], '
+                'input[type="search"], '
+                'input[aria-label*="search" i]'
+            )))
+            print(f"✅ Job input topildi (placeholder: {job_input.get_attribute('placeholder')})")
+        except Exception as e:
+            print(f"❌ Job input topilmadi: {e}")
+            self.driver.save_screenshot(f"job_input_fail_{self.job}.png")
+            self.driver.quit()
+            return
+
+        try:
+            # Location input
+            loc_input = self.wait_long.until(EC.visibility_of_element_located((
+                By.CSS_SELECTOR,
+                'input[placeholder*="City, state" i], '
+                'input[placeholder*="zipcode" i], '
+                'input[placeholder*="remote" i], '
+                'input[placeholder*="location" i]'
+            )))
+            print(f"✅ Location input topildi (placeholder: {loc_input.get_attribute('placeholder')})")
+        except Exception as e:
+            print(f"❌ Location input topilmadi: {e}")
+            self.driver.save_screenshot(f"loc_input_fail_{self.job}.png")
+            self.driver.quit()
+            return
+
+        # Ma'lumotlarni yozish
+        job_input.clear()
+        job_input.send_keys(self.job)
+        time.sleep(1.5)
+
+        loc_input.clear()
+        loc_input.send_keys(self.country)
+        time.sleep(1.5)
+
+        # Submit
+        try:
+            search_btn = self.driver.find_element(By.CSS_SELECTOR, 'button[type="submit"], button[aria-label*="Search" i]')
+            search_btn.click()
+            print("Search tugmasi bosildi")
+        except:
+            loc_input.send_keys(Keys.RETURN)
+            print("Enter bilan submit qilindi")
+
+        time.sleep(8)
+
+        # Sort by date descending
+        current_url = self.driver.current_url
+        if "sortBy=date_desc" not in current_url:
+            separator = "&" if "?" in current_url else "?"
+            self.driver.get(current_url + separator + "sortBy=date_desc")
+            time.sleep(6)
+
+        self.scroll_and_scrape_cards()
+
+    def scroll_and_scrape_cards(self):
+        last_height = self.driver.execute_script("return document.body.scrollHeight")
+        processed = set()
+
+        while True:
+            cards = self.driver.find_elements(By.CSS_SELECTOR, 'li[data-test="jobListing"], li[role="listitem"], li[class*="job-card"]')
+            print(f"Topilgan card soni: {len(cards)}")
+
+            for card in cards:
+                try:
+                    card_snippet = card.text[:80]
+                    if card_snippet in processed:
+                        continue
+                    processed.add(card_snippet)
+
+                    self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", card)
+                    time.sleep(1.2)
+                    card.click()
+                    time.sleep(2.5)
+
+                    title = self.get_text_safe('h1[data-test="job-title"], h1[class*="title"]')
+                    company = self.get_text_safe('[data-test="employer-name"], div[class*="employer"]')
+                    loc = self.get_text_safe('[data-test="job-location"], div[class*="location"]')
+                    salary = self.get_text_safe('[data-test="detailSalary"], div[class*="salary"]')
+                    posted_text = self.get_text_safe('[data-test="job-age"], span[contains(text(), "ago")]')
+
+                    skills_els = self.driver.find_elements(By.CSS_SELECTOR, '[class*="skill"], [class*="qualification"] li')
+                    skills = ", ".join(el.text.strip() for el in skills_els if el.text.strip())
+
+                    posted_date = self.parse_posted_date(posted_text)
+
+                    save_to_database(title, company, loc, self.country, self.job, skills, salary, posted_date)
+
+                except Exception as e:
+                    print(f"Card parse xatosi: {e}")
+
+            # Scroll pastga
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(4)
+
+            new_height = self.driver.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
+                print("Yangi card chiqmadi — scraping tugadi")
+                break
+            last_height = new_height
+
+    def get_text_safe(self, selector):
+        try:
+            el = self.wait_short.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+            return el.text.strip()
+        except:
+            return ""
+
+    def parse_posted_date(self, text):
+        today = datetime.date.today()
+        text = text.lower()
+        if "today" in text or "just posted" in text:
+            return today
+        if "yesterday" in text:
+            return today - datetime.timedelta(days=1)
+        days = "".join(c for c in text if c.isdigit())
+        if days:
+            return today - datetime.timedelta(days=int(days))
+        return today
+
+    def __del__(self):
+        try:
+            self.driver.quit()
+        except:
+            pass
+
+# ---------------- MAIN ----------------
+if __name__ == "__main__":
+    create_table_if_not_exists()
+
+    # Job'lar ro'yxati
+    with open(JOBS_PATH, "r", encoding="utf-8") as f:
+        jobs = json.load(f)
+
+    # Countries (agar file bor bo'lsa)
+    countries = ["United States"]
+    if COUNTRIES_PATH.exists():
+        with open(COUNTRIES_PATH, "r", encoding="utf-8") as f:
+            countries = json.load(f)
+
+    print(f"Jobs: {jobs}")
+    print(f"Countries: {countries}")
+
+    for job in jobs:
+        for country in countries:
+            try:
+                GlassdoorScraper(job, country)
+            except Exception as e:
+                print(f"Scraper xatosi ({job} - {country}): {e}")
