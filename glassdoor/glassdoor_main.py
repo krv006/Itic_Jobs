@@ -6,12 +6,15 @@ import time
 from pathlib import Path
 
 import pyodbc
+
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.chrome.options import Options
+
 
 load_dotenv()
 
@@ -86,17 +89,17 @@ def save_to_database(title, company, location, location_sub, title_sub, skills, 
 
 # ---------------- SCRAPER ----------------
 class GlassdoorScraper:
-    def __init__(self, job, country, driver=None, headless=False):
+    def __init__(self, job, country, driver=None, headless=True):
         self.job = job
         self.country = country
         self.start = 1
 
-        if driver is None:
+        if driver == None:
             options = uc.ChromeOptions()
             options.add_argument("--disable-blink-features=AutomationControlled")
             options.add_argument("--start-maximized")
             if headless:
-                options.add_argument("--headless=new")
+                options.add_argument("--headless")
             driver = uc.Chrome(options=options)
 
         self.driver = driver
@@ -240,13 +243,12 @@ class GlassdoorScraper:
 
 
 if __name__ == "__main__":
-    with open(JOBS_PATH, "r", encoding="utf-8") as f:
-        jobs = json.load(f)
-
-    driver = uc.Chrome()
+    #with open(JOBS_PATH, "r", encoding="utf-8") as f:
+    #    jobs = json.load(f)
+    jobs = ["data analyst"]
     for job in jobs:
         try:
-            GlassdoorScraper(job, "United States", driver=driver)
+            GlassdoorScraper(job, "United States")
         except Exception as e:
             print(f"Scrape error: {e}")
 
