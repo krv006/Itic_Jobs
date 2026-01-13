@@ -3,13 +3,17 @@ import json
 import os
 import re
 import time
-from typing import Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse
 
-import pyodbc
+import psycopg2
 import requests
 from bs4 import BeautifulSoup, Tag
 from dotenv import load_dotenv
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+
+load_dotenv()
 
 BASE_URL = "https://it-market.uz"
 LIST_URL = f"{BASE_URL}/job/"
@@ -41,122 +45,185 @@ BAD_SKILL_EXACT = {
 META_VALUES_TO_EXCLUDE_FROM_SKILLS = set(WORK_STYLES + EMP_TYPES + EXPERIENCES)
 
 
-# -------------------------
-# ENV + KEYWORDS
-# -------------------------
-def load_env() -> Dict[str, str]:
-    load_dotenv()
-    cfg = {
-        "driver": os.getenv("DB_DRIVER", "{ODBC Driver 17 for SQL Server}"),
-        "server": os.getenv("DB_SERVER"),
-        "db_name": os.getenv("DB_NAME"),
-        "trusted": os.getenv("DB_TRUSTED_CONNECTION", "yes"),
-    }
-    if not cfg["server"] or not cfg["db_name"]:
-        raise RuntimeError("DB_SERVER yoki DB_NAME .env da yo'q yoki bo'sh.")
-    return cfg
+def env_bool(key: str, default: str = "false") -> bool:
+    return os.getenv(key, default).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def load_keywords(path: str = "job_list.json") -> List[str]:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, list) or not all(isinstance(x, str) for x in data):
-        raise RuntimeError("job_list.json list[str] bo'lishi kerak.")
-    return [x.strip() for x in data if x.strip()]
+def env_int(key: str, default: int) -> int:
+    try:
+        return int(str(os.getenv(key, default)).strip())
+    except Exception:
+        return default
 
 
-# -------------------------
-# HTTP (✅ retry + backoff)
-# -------------------------
+def env_str(key: str, default: str = "") -> str:
+    return str(os.getenv(key, default)).strip()
+
+
+conn = psycopg2.connect(
+    host=env_str("DB_HOST", "localhost"),
+    port=env_str("DB_PORT", "5432"),
+    dbname=env_str("DB_NAME", "itic"),
+    user=env_str("DB_USER", "postgres"),
+    password=env_str("DB_PASSWORD", ""),
+)
+conn.autocommit = True
+cursor = conn.cursor()
+
+
+def create_table_if_not_exists():
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS it_park (
+            id BIGSERIAL PRIMARY KEY,
+            source TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            job_title TEXT,
+            location TEXT,
+            skills TEXT,
+            salary TEXT,
+            education TEXT,
+            job_type TEXT,
+            company_name TEXT,
+            job_url TEXT,
+            description TEXT,
+            job_subtitle TEXT,
+            posted_date DATE,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE (source, job_id)
+        );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_it_park_source ON it_park (source);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_it_park_posted_date ON it_park (posted_date);")
+    print("[DB] it_park table ready ✅")
+
+
+def save_to_database(data: dict) -> bool:
+    cursor.execute("""
+        INSERT INTO it_park (
+            source, job_id, job_title, location, skills, salary,
+            education, job_type, company_name, job_url,
+            description, job_subtitle, posted_date
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (source, job_id) DO NOTHING;
+    """, (
+        data["source"],
+        data["job_id"],
+        data["job_title"],
+        data["location"],
+        data["skills"],
+        data["salary"],
+        data["education"],
+        data["job_type"],
+        data["company_name"],
+        data["job_url"],
+        data["description"],
+        data["job_subtitle"],
+        data["posted_date"],
+    ))
+    return cursor.rowcount == 1
+
+
 def make_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8,uz;q=0.7",
-            "Connection": "keep-alive",
-        }
-    )
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8,uz;q=0.7",
+        "Connection": "keep-alive",
+    })
     return s
 
 
-def get_soup(
-        session: requests.Session,
-        url: str,
-        params: Optional[dict] = None,
-        retries: int = 4,
-        timeout: tuple = (10, 45),  # (connect, read)
-) -> Optional[BeautifulSoup]:
-    """
-    - 404 -> None
-    - Timeout/429/5xx -> retry + backoff
-    - baribir bo'lmasa -> None (script yiqilmaydi)
-    """
+def get_soup_requests(session: requests.Session, url: str, params: dict | None = None,
+                      retries: int = 3) -> BeautifulSoup | None:
     last_err = None
     for attempt in range(1, retries + 1):
         try:
-            r = session.get(url, params=params, timeout=timeout)
+            r = session.get(url, params=params, timeout=(10, 45))
 
             if r.status_code == 404:
                 return None
 
-            # 429 / 5xx -> retry
             if r.status_code in (429, 500, 502, 503, 504):
                 last_err = f"HTTP {r.status_code}"
-                sleep_s = min(20, 2 ** (attempt - 1))
-                time.sleep(sleep_s)
+                time.sleep(min(15, 2 ** (attempt - 1)))
                 continue
 
             r.raise_for_status()
             return BeautifulSoup(r.text, "html.parser")
 
-        except requests.exceptions.ReadTimeout as e:
-            last_err = e
-            time.sleep(min(20, 2 ** (attempt - 1)))
-        except requests.exceptions.ConnectionError as e:
-            last_err = e
-            time.sleep(min(20, 2 ** (attempt - 1)))
         except requests.exceptions.RequestException as e:
-            # boshqa error bo'lsa ham yiqitmaymiz
             last_err = e
-            break
+            time.sleep(min(15, 2 ** (attempt - 1)))
 
-    print(f"[WARN] get_soup failed: {url} err={last_err}")
+    print(f"[WARN] requests failed: {url} err={last_err}")
     return None
+
+
+def create_driver():
+    options = Options()
+
+    if env_bool("HEADLESS", "true"):
+        options.add_argument("--headless=new")
+
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+
+    ws = env_str("CHROME_WINDOW_SIZE", "1920,1080")
+    options.add_argument(f"--window-size={ws}")
+
+    service = Service()
+    driver = webdriver.Chrome(service=service, options=options)
+
+    driver.set_page_load_timeout(env_int("PAGE_LOAD_TIMEOUT", 20))
+
+    driver.implicitly_wait(env_int("IMPLICIT_WAIT", 5))
+
+    return driver
+
+
+def get_soup_selenium(driver, url: str) -> BeautifulSoup | None:
+    try:
+        driver.get(url)
+        return BeautifulSoup(driver.page_source, "html.parser")
+    except Exception as e:
+        print(f"[WARN] selenium failed: {url} -> {e}")
+        return None
 
 
 def norm(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
 
-def extract_job_id(job_url: str) -> Optional[str]:
+def extract_job_id(job_url: str) -> str:
     path = urlparse(job_url).path.rstrip("/") + "/"
     m = re.match(r"^/job/([A-Za-z0-9]+)/$", path)
-    return m.group(1) if m else None
+    return m.group(1) if m else job_url
 
 
-def lines_from(root: Tag) -> List[str]:
+def lines_from(root: Tag) -> list[str]:
     lines = [norm(x) for x in root.get_text("\n").split("\n")]
     return [x for x in lines if x]
 
 
-# -------------------------
-# LIST
-# -------------------------
-def parse_list_for_job_links(soup: BeautifulSoup) -> List[str]:
+def parse_list_for_job_links(soup: BeautifulSoup) -> list[str]:
     links = []
     for a in soup.select("a[href]"):
         href = (a.get("href") or "").strip()
+
         if not href.startswith("/job/"):
             continue
         if "/apply" in href:
             continue
+
         m = JOB_PATH_RE.match(href.rstrip("/") + "/")
         if not m:
             continue
+
         links.append(urljoin(BASE_URL, href))
 
     out, seen = [], set()
@@ -167,15 +234,16 @@ def parse_list_for_job_links(soup: BeautifulSoup) -> List[str]:
     return out
 
 
-def collect_job_urls_all_pages(session: requests.Session, max_pages: int = 300) -> List[str]:
-    all_urls: List[str] = []
-    seen: Set[str] = set()
+def collect_job_urls_all_pages(session: requests.Session, max_pages: int = 300) -> list[str]:
+    all_urls = []
+    seen = set()
 
     for page in range(1, max_pages + 1):
         params = {} if page == 1 else {"page": page}
-        soup = get_soup(session, LIST_URL, params=params)
+        soup = get_soup_requests(session, LIST_URL, params=params)
+
         if soup is None:
-            print(f"[STOP] page={page} -> 404/no response")
+            print(f"[STOP] page={page} -> no response / 404")
             break
 
         urls = parse_list_for_job_links(soup)
@@ -183,38 +251,57 @@ def collect_job_urls_all_pages(session: requests.Session, max_pages: int = 300) 
             print(f"[STOP] page={page} -> no links")
             break
 
-        new_cnt = 0
+        new_count = 0
         for u in urls:
             if u not in seen:
                 seen.add(u)
                 all_urls.append(u)
-                new_cnt += 1
+                new_count += 1
 
-        print(f"[PAGE] {page} urls={len(urls)} new={new_cnt} total={len(all_urls)}")
+        print(f"[PAGE] {page} urls={len(urls)} new={new_count} total={len(all_urls)}")
 
-        if new_cnt == 0 and page > 2:
+        if new_count == 0 and page > 2:
             print(f"[STOP] page={page} -> no new urls")
             break
+
+        time.sleep(0.2)
 
     return all_urls
 
 
-# -------------------------
-# META / SKILLS
-# -------------------------
-def extract_meta_from_text(lines: List[str]) -> Dict[str, Optional[str]]:
+def extract_company_name(lines: list[str]) -> str:
+    if "Company Name" not in lines:
+        return ""
+    i = lines.index("Company Name")
+    return lines[i + 1] if i + 1 < len(lines) else ""
+
+
+def parse_section_text(lines: list[str], section_name: str) -> str:
+    if section_name not in lines:
+        return ""
+    i = lines.index(section_name)
+    stop = set(META_LABELS + SECTION_LABELS + ["Minimum age", "Maximum age", "Comments"])
+    buf = []
+    for j in range(i + 1, len(lines)):
+        t = lines[j]
+        if t in stop:
+            break
+        if t:
+            buf.append(t)
+    return norm(" ".join(buf))
+
+
+def extract_meta(lines: list[str]) -> dict:
     text = " ".join(lines)
 
     m = SALARY_RE.search(text)
-    salary = norm(m.group("salary")) if m else None
+    salary = norm(m.group("salary")) if m else ""
 
-    ws_found = [ws for ws in WORK_STYLES if re.search(rf"\b{re.escape(ws)}\b", text)]
-    work_style = ", ".join(ws_found) if ws_found else None
+    work_style = ", ".join([ws for ws in WORK_STYLES if ws in text]) or ""
+    employment_type = next((et for et in EMP_TYPES if et in text), "")
+    work_experience = next((ex for ex in EXPERIENCES if ex in text), "")
 
-    employment_type = next((et for et in EMP_TYPES if re.search(rf"\b{re.escape(et)}\b", text)), None)
-    work_experience = next((ex for ex in EXPERIENCES if re.search(rf"\b{re.escape(ex)}\b", text)), None)
-
-    location = None
+    location = ""
     if "Location" in lines:
         i = lines.index("Location")
         stop = set(META_LABELS + SECTION_LABELS)
@@ -227,41 +314,15 @@ def extract_meta_from_text(lines: List[str]) -> Dict[str, Optional[str]]:
                 break
 
     return {
-        "work_style": work_style,
         "salary": salary,
-        "work_experience": work_experience,
+        "work_style": work_style,
         "employment_type": employment_type,
+        "work_experience": work_experience,
         "location": location,
     }
 
 
-def extract_company_name(lines: List[str]) -> Optional[str]:
-    if "Company Name" not in lines:
-        return None
-    i = lines.index("Company Name")
-    if i + 1 < len(lines):
-        v = lines[i + 1]
-        if v and v not in BAD_SKILL_EXACT:
-            return v
-    return None
-
-
-def parse_section_text(lines: List[str], section_name: str) -> Optional[str]:
-    if section_name not in lines:
-        return None
-    i = lines.index(section_name)
-    stop = set(META_LABELS + SECTION_LABELS + ["Minimum age", "Maximum age", "Comments"])
-    buf = []
-    for j in range(i + 1, len(lines)):
-        t = lines[j]
-        if t in stop:
-            break
-        if t:
-            buf.append(t)
-    return norm(" ".join(buf)) if buf else None
-
-
-def extract_required_skills(lines: List[str]) -> List[str]:
+def extract_required_skills(lines: list[str]) -> list[str]:
     if "Required Skills" not in lines:
         return []
 
@@ -269,7 +330,7 @@ def extract_required_skills(lines: List[str]) -> List[str]:
     stop = set(META_LABELS + SECTION_LABELS + ["Address:", "Phone:", "Email:", "Jobs by specializations", "Comments"])
     out = []
 
-    for j in range(i + 1, min(i + 140, len(lines))):
+    for j in range(i + 1, min(i + 150, len(lines))):
         t = lines[j]
         if t in stop:
             break
@@ -296,7 +357,7 @@ def extract_required_skills(lines: List[str]) -> List[str]:
     return res
 
 
-def extract_category_chips(lines: List[str]) -> List[str]:
+def extract_category_chips(lines: list[str]) -> list[str]:
     out = []
     for t in lines:
         if not t:
@@ -319,150 +380,23 @@ def extract_category_chips(lines: List[str]) -> List[str]:
         if x not in seen:
             res.append(x)
             seen.add(x)
-
     return res[:40]
 
 
-# -------------------------
-# KEYWORD MATCH
-# -------------------------
-def keyword_match_text(text: str, keyword: str) -> bool:
-    t = (text or "").lower()
-    kw = (keyword or "").strip().lower()
+def parse_detail(job_url: str, soup: BeautifulSoup) -> dict:
+    job_id = extract_job_id(job_url)
 
-    if "/" in kw:
-        parts = [p.strip().lower() for p in kw.split("/") if p.strip()]
-        for p in parts:
-            if len(p) <= 2:
-                if re.search(rf"\b{re.escape(p)}\b", t):
-                    return True
-            else:
-                if p in t:
-                    return True
-        return False
-
-    if len(kw) <= 2:
-        return bool(re.search(rf"\b{re.escape(kw)}\b", t))
-
-    return kw in t
-
-
-def matched_keywords(job: Dict, keywords: List[str]) -> List[str]:
-    hay = " ".join(
-        [
-            str(job.get("job_title") or ""),
-            str(job.get("skills") or ""),
-            str(job.get("description") or ""),
-            str(job.get("job_subtitle") or ""),
-            str(job.get("company_name") or ""),
-        ]
-    )
-    out, seen = [], set()
-    for kw in keywords:
-        if keyword_match_text(hay, kw) and kw not in seen:
-            out.append(kw)
-            seen.add(kw)
-    return out
-
-
-# -------------------------
-# DB
-# -------------------------
-def get_conn(cfg: Dict[str, str]) -> pyodbc.Connection:
-    return pyodbc.connect(
-        f"Driver={cfg['driver']};"
-        f"Server={cfg['server']};"
-        f"Database={cfg['db_name']};"
-        f"Trusted_Connection={cfg['trusted']};"
-    )
-
-
-def load_existing_ids(cursor: pyodbc.Cursor) -> Set[str]:
-    cursor.execute("SELECT job_id FROM it_park")
-    return {row[0] for row in cursor.fetchall()}
-
-
-def clip(s: Optional[str], n: int) -> Optional[str]:
-    if s is None:
-        return None
-    s = str(s)
-    return s[:n] if len(s) > n else s
-
-
-def save_to_db(cursor: pyodbc.Cursor, job: Dict) -> bool:
-    sql = """
-    INSERT INTO it_park(
-        job_id, job_title, location, skills, salary, education, job_type,
-        company_name, job_url, source, description, job_subtitle, posted_date
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
-    try:
-        cursor.execute(
-            sql,
-            (
-                job["job_id"],
-                clip(job.get("job_title"), 100),
-                clip(job.get("location"), 100),
-                job.get("skills"),
-                job.get("salary"),
-                clip(job.get("education"), 100),
-                clip(job.get("job_type"), 50),
-                clip(job.get("company_name"), 100),
-                clip(job.get("job_url"), 200),
-                clip(job.get("source"), 20),
-                job.get("description"),
-                clip(job.get("job_subtitle"), 250),
-                job["posted_date"],
-            ),
-        )
-        return True
-    except pyodbc.IntegrityError:
-        return False
-
-
-# -------------------------
-# DETAIL
-# -------------------------
-def parse_detail(job_url: str, soup: BeautifulSoup) -> Dict:
-    job_id = extract_job_id(job_url) or job_url
     root = soup.select_one("main") or soup.body or soup
     lines = lines_from(root)
 
-    h1 = root.select_one("h1") or soup.select_one("h1")
-    job_title = norm(h1.get_text(" ", strip=True)) if h1 else None
+    h1 = soup.select_one("h1")
+    job_title = norm(h1.get_text(" ", strip=True)) if h1 else ""
 
-    updated = None
+    updated = ""
     for t in lines:
         if t.startswith("Updated:"):
             updated = norm(t.replace("Updated:", ""))
             break
-
-    company_name = extract_company_name(lines)
-
-    meta = extract_meta_from_text(lines)
-    work_style = meta["work_style"]
-    salary = meta["salary"]
-    work_experience = meta["work_experience"]
-    employment_type = meta["employment_type"]
-    location = meta["location"]
-
-    # ✅ job_type faqat employment_type
-    job_type = employment_type
-
-    # ✅ subtitle faqat meta
-    parts = []
-    if work_style:
-        parts.append(work_style)
-    if work_experience:
-        parts.append(work_experience)
-    if employment_type:
-        parts.append(employment_type)
-    job_subtitle = " | ".join(parts) if parts else None
-
-    description = parse_section_text(lines, "Description")
-    tasks = parse_section_text(lines, "Tasks")
-    schedule = parse_section_text(lines, "Schedule")
-    add_req = parse_section_text(lines, "Additional requirements")
 
     posted_date = dt.date.today()
     if updated:
@@ -473,113 +407,133 @@ def parse_detail(job_url: str, soup: BeautifulSoup) -> Dict:
             except ValueError:
                 pass
 
+    company_name = extract_company_name(lines)
+    meta = extract_meta(lines)
+
+    job_type = meta["employment_type"]
+    job_subtitle = " | ".join([x for x in [meta["work_style"], meta["work_experience"], meta["employment_type"]] if x])
+
+    description = parse_section_text(lines, "Description")
+    tasks = parse_section_text(lines, "Tasks")
+    schedule = parse_section_text(lines, "Schedule")
+    add_req = parse_section_text(lines, "Additional requirements")
+
     skills_list = extract_required_skills(lines)
     if not skills_list:
         skills_list = extract_category_chips(lines)
-    skills_final = ", ".join(skills_list) if skills_list else None
+    skills_final = ", ".join(skills_list)
 
-    desc_parts = []
+    full_desc_parts = []
     if description:
-        desc_parts.append("DESCRIPTION: " + description)
+        full_desc_parts.append("DESCRIPTION: " + description)
     if tasks:
-        desc_parts.append("TASKS: " + tasks)
+        full_desc_parts.append("TASKS: " + tasks)
     if schedule:
-        desc_parts.append("SCHEDULE: " + schedule)
+        full_desc_parts.append("SCHEDULE: " + schedule)
     if add_req:
-        desc_parts.append("ADDITIONAL REQUIREMENTS: " + add_req)
-    full_description = "\n\n".join(desc_parts) if desc_parts else None
+        full_desc_parts.append("ADDITIONAL REQUIREMENTS: " + add_req)
+
+    full_description = "\n\n".join(full_desc_parts)
 
     return {
+        "source": "it-market",
         "job_id": job_id,
         "job_title": job_title,
-        "location": location,
+        "location": meta["location"],
         "skills": skills_final,
-        "salary": salary,
-        "education": None,
+        "salary": meta["salary"],
+        "education": "",
         "job_type": job_type,
         "company_name": company_name,
         "job_url": job_url,
-        "source": "it-market",
         "description": full_description,
         "job_subtitle": job_subtitle,
         "posted_date": posted_date,
     }
 
 
-# -------------------------
-# RUN
-# -------------------------
-def run(max_pages: int = 300):
-    cfg = load_env()
-    keywords = load_keywords("job_list.json")
+def keyword_match_text(text: str, keyword: str) -> bool:
+    t = (text or "").lower()
+    kw = (keyword or "").strip().lower()
+    if not kw:
+        return False
+    if len(kw) <= 2:
+        return bool(re.search(rf"\b{re.escape(kw)}\b", t))
+    return kw in t
+
+
+def matched_keywords(job: dict, keywords: list[str]) -> list[str]:
+    hay = " ".join([
+        job.get("job_title", ""),
+        job.get("skills", ""),
+        job.get("description", ""),
+        job.get("job_subtitle", ""),
+        job.get("company_name", ""),
+    ])
+    return [kw for kw in keywords if keyword_match_text(hay, kw)]
+
+
+def main():
+    create_table_if_not_exists()
+
+    with open("job_list.json", "r", encoding="utf-8") as f:
+        keywords = json.load(f)
 
     session = make_session()
-    conn = get_conn(cfg)
-    cursor = conn.cursor()
+    driver = None
 
-    existing_ids = load_existing_ids(cursor)
-    print(f"[DB] existing_ids={len(existing_ids)}")
+    try:
+        driver = create_driver()
 
-    urls = collect_job_urls_all_pages(session, max_pages=max_pages)
-    print(f"\n[LIST DONE] total_urls={len(urls)}")
+        max_pages = env_int("MAX_PAGES", 300)
+        urls = collect_job_urls_all_pages(session, max_pages=max_pages)
+        print(f"\n[LIST DONE] total_urls={len(urls)}")
 
-    inserted = 0
-    duplicates = 0
-    matched_cnt = 0
-    skipped_before_detail = 0
-    failed_details = 0
+        inserted = 0
+        duplicates = 0
+        failed_details = 0
 
-    for url in urls:
-        jid = extract_job_id(url) or url
-        if jid in existing_ids:
-            duplicates += 1
-            skipped_before_detail += 1
-            continue
+        for url in urls:
+            soup = get_soup_requests(session, url)
 
-        dsoup = get_soup(session, url)
-        if dsoup is None:
-            failed_details += 1
-            continue
+            if soup is None or not soup.select_one("h1"):
+                soup = get_soup_selenium(driver, url)
 
+            if soup is None:
+                failed_details += 1
+                continue
+
+            job = parse_detail(url, soup)
+
+            hits = matched_keywords(job, keywords)
+            if not hits:
+                continue
+
+            ok = save_to_database(job)
+            if ok:
+                inserted += 1
+                print(f"SAVED: {job['job_id']} | {job.get('job_title')} | kw={hits}")
+            else:
+                duplicates += 1
+                print(f"DUP: {job['job_id']}")
+
+            time.sleep(0.2)
+
+        print("\nDONE ✅")
+        print(f"inserted={inserted} duplicates={duplicates} failed_details={failed_details} scanned_urls={len(urls)}")
+
+    finally:
         try:
-            job = parse_detail(url, dsoup)
-        except Exception as e:
-            failed_details += 1
-            print(f"[WARN] parse_detail error: {url} -> {e}")
-            continue
-
-        hits = matched_keywords(job, keywords)
-        if not hits:
-            continue
-
-        ok = save_to_db(cursor, job)
-        if ok:
-            conn.commit()
-            inserted += 1
-            matched_cnt += 1
-            existing_ids.add(jid)
-            print(
-                f"[SAVE] {jid} | {job.get('job_title')} | kw={hits} | "
-                f"company={job.get('company_name')} | job_type={job.get('job_type')} | "
-                f"salary={job.get('salary')} | loc={job.get('location')}"
-            )
-        else:
-            duplicates += 1
-            existing_ids.add(jid)
-
-        # serverga bosim qilmaslik uchun kichik delay
-        time.sleep(0.2)
-
-    cursor.close()
-    conn.close()
-
-    print("\nDONE")
-    print(
-        f"matched={matched_cnt} inserted={inserted} duplicates={duplicates} "
-        f"skipped_before_detail={skipped_before_detail} failed_details={failed_details} "
-        f"scanned_urls={len(urls)}"
-    )
+            if driver:
+                driver.quit()
+        except Exception:
+            pass
+        try:
+            cursor.close()
+            conn.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    run(max_pages=300)
+    main()
