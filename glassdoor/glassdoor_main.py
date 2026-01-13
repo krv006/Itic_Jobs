@@ -89,7 +89,7 @@ def save_to_database(title, company, location, location_sub, title_sub, skills, 
 
 # ---------------- SCRAPER ----------------
 class GlassdoorScraper:
-    def __init__(self, job, country, driver=None, headless=True):
+    def __init__(self, job, country, driver=None, headless=False):
         self.job = job
         self.country = country
         self.start = 1
@@ -252,4 +252,4 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Scrape error: {e}")
 
-    driver.quit()
+    
