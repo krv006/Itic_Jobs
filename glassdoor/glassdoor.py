@@ -5,7 +5,7 @@ import os
 import time
 from pathlib import Path
 
-import psycopg2
+import pyodbc
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
 from selenium.webdriver.common.by import By
@@ -33,78 +33,51 @@ def clear_and_type(el, text):
     el.send_keys(text)
 
 
-def ensure_table_exists(cur):
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS glassdoor (
-            id SERIAL PRIMARY KEY,
-            job_hash CHAR(64) UNIQUE NOT NULL,
-            title TEXT,
-            company TEXT,
-            location TEXT,
-            location_sub TEXT,
-            title_sub TEXT,
-            skills TEXT,
-            salary TEXT,
-            date DATE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """
-    )
-
-
 def save_to_database(title, company, location, location_sub, title_sub, skills, salary, date):
     conn = None
     try:
-        pg_host = os.getenv("DB_HOST")
-        pg_port = os.getenv("DB_PORT", "5432")
-        pg_db = os.getenv("DB_NAME")
-        pg_user = os.getenv("DB_USER")
-        pg_password = os.getenv("DB_PASSWORD    ")
+        driver = os.getenv("DB_DRIVER")
+        server = os.getenv("DB_SERVER")
+        db_name = os.getenv("DB_NAME")
+        trusted = os.getenv("DB_TRUSTED_CONNECTION", "yes")
 
-        if not all([pg_host, pg_db, pg_user, pg_password]):
-            raise ValueError("Postgres .env variables not fully set (PG_HOST, PG_DB, PG_USER, PG_PASSWORD)")
+        print("DRIVER:", os.getenv("DB_DRIVER"))
+        print("SERVER:", os.getenv("DB_SERVER"))
+        print("DB:", os.getenv("DB_NAME"))
 
-        conn = psycopg2.connect(
-            host=pg_host,
-            port=int(pg_port),
-            dbname=pg_db,
-            user=pg_user,
-            password=pg_password,
+        if not all([driver, server, db_name]):
+            raise ValueError("DB .env variables not fully set")
+
+        conn = pyodbc.connect(
+            f"Driver={driver};"
+            f"Server={server};"
+            f"Database={db_name};"
+            f"Trusted_Connection={trusted};",
+            autocommit=False
         )
-        conn.autocommit = False
-        cur = conn.cursor()
 
-        # ✅ auto-create table
-        ensure_table_exists(cur)
-
+        cursor = conn.cursor()
         h = job_hash(title, company, location, date)
 
-        # ✅ insert (duplicate -> skip)
-        cur.execute(
+        cursor.execute(
             """
-            INSERT INTO glassdoor (
+            INSERT INTO dbo.Glassdoor (
                 job_hash, title, company, location,
                 location_sub, title_sub, skills,
-                salary, date
+                salary, [date]
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (job_hash) DO NOTHING
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (h, title, company, location, location_sub, title_sub, skills, salary, date)
         )
 
         conn.commit()
+        print(f"✅ Saved: {title} @ {company}")
 
-        # agar duplicate bo'lsa rowcount=0 bo'ladi
-        if cur.rowcount == 0:
-            print(f"⚠️ Duplicate skipped: {title} @ {company}")
-        else:
-            print(f"✅ Saved: {title} @ {company}")
+    except pyodbc.IntegrityError:
+        print(f"⚠️ Duplicate skipped: {title} @ {company}")
 
     except Exception as e:
-        if conn:
-            conn.rollback()
         print(f"❌ DB error: {e}")
 
     finally:
@@ -241,14 +214,11 @@ class GlassdoorScraper:
             salary = ""
 
         try:
-            skills = ",".join(
-                x.text for x in self.wait1.until(
-                    EC.visibility_of_all_elements_located(
-                        (By.XPATH, "//li[contains(@class,'PendingQualification_pendingQualification')]")
-                    )
+            skills = ",".join(x.text for x in self.wait1.until(
+                EC.visibility_of_all_elements_located(
+                    (By.XPATH, "//li[contains(@class,'PendingQualification_pendingQualification')]")
                 )
-                if x.text.strip()
-            )
+            ) if x.text.strip())
         except:
             skills = ""
 
