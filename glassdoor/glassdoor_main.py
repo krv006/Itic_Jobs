@@ -20,6 +20,9 @@ CONN_PATH = BASE_DIR / "conn.json"
 COOKIES_PATH = BASE_DIR / "cookies.json"
 JOBS_PATH = BASE_DIR / "job_list.json"
 
+# Table create bo'lganini 1 marta belgilab qo'yamiz
+_TABLE_READY = False
+
 
 def job_hash(title, company, location, date):
     raw = f"{title}|{company}|{location}|{date}".lower().strip()
@@ -53,17 +56,28 @@ def ensure_table_exists(cur):
     )
 
 
+def _env_required(key: str) -> str:
+    val = os.getenv(key)
+    if val is None:
+        return ""
+    return val.strip()
+
+
 def save_to_database(title, company, location, location_sub, title_sub, skills, salary, date):
+    global _TABLE_READY
     conn = None
     try:
-        pg_host = os.getenv("DB_HOST")
-        pg_port = os.getenv("DB_PORT", "5432")
-        pg_db = os.getenv("DB_NAME")
-        pg_user = os.getenv("DB_USER")
-        pg_password = os.getenv("DB_PASSWORD    ")
+        # ✅ Senda DB_ nomlar bilan bo'lgani uchun shuni ishlatamiz
+        pg_host = _env_required("DB_HOST")
+        pg_port = _env_required("DB_PORT") or "5432"
+        pg_db = _env_required("DB_NAME")
+        pg_user = _env_required("DB_USER")
+        pg_password = _env_required("DB_PASSWORD")  # ✅ bo'sh joylarsiz
 
         if not all([pg_host, pg_db, pg_user, pg_password]):
-            raise ValueError("Postgres .env variables not fully set (PG_HOST, PG_DB, PG_USER, PG_PASSWORD)")
+            raise ValueError(
+                "Postgres .env variables not fully set: DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD"
+            )
 
         conn = psycopg2.connect(
             host=pg_host,
@@ -75,8 +89,11 @@ def save_to_database(title, company, location, location_sub, title_sub, skills, 
         conn.autocommit = False
         cur = conn.cursor()
 
-        # ✅ auto-create table
-        ensure_table_exists(cur)
+        # ✅ table create faqat 1 marta (process davomida)
+        if not _TABLE_READY:
+            ensure_table_exists(cur)
+            conn.commit()
+            _TABLE_READY = True
 
         h = job_hash(title, company, location, date)
 
@@ -96,7 +113,6 @@ def save_to_database(title, company, location, location_sub, title_sub, skills, 
 
         conn.commit()
 
-        # agar duplicate bo'lsa rowcount=0 bo'ladi
         if cur.rowcount == 0:
             print(f"⚠️ Duplicate skipped: {title} @ {company}")
         else:
@@ -104,12 +120,18 @@ def save_to_database(title, company, location, location_sub, title_sub, skills, 
 
     except Exception as e:
         if conn:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         print(f"❌ DB error: {e}")
 
     finally:
         if conn:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 class GlassdoorScraper:
@@ -142,7 +164,7 @@ class GlassdoorScraper:
                     c.pop("sameSite", None)
                     try:
                         self.driver.add_cookie(c)
-                    except:
+                    except Exception:
                         pass
             self.driver.refresh()
             time.sleep(2)
@@ -201,55 +223,57 @@ class GlassdoorScraper:
             self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
             el.click()
             time.sleep(1)
-        except:
+        except Exception:
             return False
 
         try:
             company = self.wait1.until(
                 EC.presence_of_element_located(
-                    (By.XPATH, "//div[contains(@class,'EmployerProfile_employerNameHeading')]"))
+                    (By.XPATH, "//div[contains(@class,'EmployerProfile_employerNameHeading')]")
+                )
             ).text
-        except:
+        except Exception:
             company = ""
 
         try:
             title = self.wait1.until(
                 EC.presence_of_element_located((By.XPATH, "//h1[contains(@id,'job-title')]"))
             ).text
-        except:
+        except Exception:
             title = ""
 
         try:
             location = self.wait1.until(
                 EC.presence_of_element_located((By.XPATH, f"{base}//div[contains(@data-test,'emp-location')]"))
             ).text
-        except:
+        except Exception:
             location = ""
 
         try:
             posted = self.wait1.until(
                 EC.presence_of_element_located((By.XPATH, f"{base}//div[contains(@data-test,'job-age')]"))
             ).text.lower()
-        except:
+        except Exception:
             posted = ""
 
         try:
             salary = self.wait1.until(
                 EC.presence_of_element_located((By.XPATH, "//div[contains(@id,'job-salary')]"))
             ).text
-        except:
+        except Exception:
             salary = ""
 
         try:
             skills = ",".join(
-                x.text for x in self.wait1.until(
+                x.text
+                for x in self.wait1.until(
                     EC.visibility_of_all_elements_located(
                         (By.XPATH, "//li[contains(@class,'PendingQualification_pendingQualification')]")
                     )
                 )
                 if x.text.strip()
             )
-        except:
+        except Exception:
             skills = ""
 
         today = datetime.date.today()
@@ -274,10 +298,16 @@ if __name__ == "__main__":
         jobs = json.load(f)
 
     driver = uc.Chrome()
-    for job in jobs:
-        try:
-            GlassdoorScraper(job, "United States", driver=driver)
-        except Exception as e:
-            print(f"Scrape error: {e}")
 
-    driver.quit()
+    try:
+        for job in jobs:
+            try:
+                GlassdoorScraper(job, "United States", driver=driver)
+            except Exception as e:
+                print(f"Scrape error: {e}")
+    finally:
+        # ✅ WinError 6 chiqmasligi uchun "safe quit"
+        try:
+            driver.quit()
+        except Exception:
+            pass
