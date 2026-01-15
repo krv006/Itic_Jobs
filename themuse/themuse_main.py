@@ -4,7 +4,7 @@ import re
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import psycopg2
 import undetected_chromedriver as uc
@@ -27,19 +27,19 @@ BASE_URL = "https://www.themuse.com/search"
 DEFAULT_WAIT = int(os.getenv("SELENIUM_WAIT", "25"))
 HEADLESS = os.getenv("HEADLESS", "false").strip().lower() in ("1", "true", "yes")
 MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))
-PAGE_SLEEP = float(os.getenv("PAGE_SLEEP", "0.7"))
+PAGE_SLEEP = float(os.getenv("PAGE_SLEEP", "0.6"))
 
-# ✅ ENG MUHIM: har jobda DB ga yozamiz
+# ✅ tab ko‘paymasin + har jobda yozib boramiz
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
 MAX_STALE_RETRY = int(os.getenv("MAX_STALE_RETRY", "3"))
 
 
 # ===================== DB =====================
 def env_required(key: str) -> str:
-    val = os.getenv(key)
-    if not val:
+    v = os.getenv(key)
+    if not v:
         raise RuntimeError(f".env da {key} topilmadi yoki bo‘sh!")
-    return val
+    return v
 
 
 def open_db():
@@ -60,7 +60,7 @@ def open_db():
     return conn
 
 
-def ensure_table_exists(cur):
+def ensure_table(cur):
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS public.themuse (
@@ -87,8 +87,16 @@ def upsert_jobs(cur, rows: List[Dict[str, Any]]):
         return
 
     cols = [
-        "job_id", "source", "job_title", "company_name", "location",
-        "salary", "job_type", "skills", "education", "job_url"
+        "job_id",
+        "source",
+        "job_title",
+        "company_name",
+        "location",
+        "salary",
+        "job_type",
+        "skills",
+        "education",
+        "job_url",
     ]
     values = [tuple(r.get(c) for c in cols) for r in rows]
 
@@ -161,15 +169,35 @@ def close_popups(driver):
         try:
             for e in driver.find_elements(by, sel)[:2]:
                 if e.is_displayed():
-                    safe_click(driver, e)
+                    try:
+                        driver.execute_script("arguments[0].click();", e)
+                    except Exception:
+                        pass
                     time.sleep(0.2)
         except Exception:
             pass
 
 
-# ===================== PARSING =====================
+def close_extra_tabs(driver, main_handle: str):
+    # ✅ 10-15 tab bo‘lib ketmasligi uchun eng muhim funksiya
+    try:
+        handles = driver.window_handles
+        for h in handles:
+            if h != main_handle:
+                try:
+                    driver.switch_to.window(h)
+                    driver.close()
+                except Exception:
+                    pass
+        driver.switch_to.window(main_handle)
+    except Exception:
+        pass
+
+
+# ===================== URL / PARSE =====================
 def build_search_url(keyword: str, page: int) -> str:
-    kw = urllib.parse.quote(keyword.strip())
+    # ✅ slash ham encode bo‘lsin: VR/AR -> VR%2FAR
+    kw = urllib.parse.quote(keyword.strip(), safe="")
     return f"{BASE_URL}/keyword/{kw}?page={page}"
 
 
@@ -185,7 +213,8 @@ def parse_job_id_from_url(url: str) -> str:
     return url
 
 
-def parse_card_location(card_text: str) -> Optional[str]:
+def parse_location_from_card_text(card_text: str) -> Optional[str]:
+    # "At Company - Remote / Flexible"
     if " - " in card_text:
         loc = card_text.split(" - ", 1)[1].strip()
         loc = re.sub(r"\s+Posted on.*$", "", loc, flags=re.IGNORECASE).strip()
@@ -193,82 +222,104 @@ def parse_card_location(card_text: str) -> Optional[str]:
     return None
 
 
-def get_view_links(driver):
-    return driver.find_elements(By.XPATH, "//a[contains(translate(.,'view job','VIEW JOB'),'VIEW JOB')]")
+# ===================== LEFT LIST (ROBUST) =====================
+def wait_left_list(driver):
+    # ✅ Oldin ishlagan usul: "VIEW JOB" borligini kutamiz
+    wait(driver).until(
+        EC.presence_of_element_located(
+            (By.XPATH, "//*[contains(translate(.,'view job','VIEW JOB'),'VIEW JOB')]")
+        )
+    )
 
 
-def click_and_wait_detail(driver, link_el):
-    old = ""
+def get_left_cards(driver) -> List[Tuple[Any, Any]]:
+    """
+    Chap listdagi elementlarni topamiz:
+    - "VIEW JOB" anchor/button ni olamiz
+    - uning card containerini ham topib, location chiqaramiz
+    """
+    # View job linklar (a yoki button bo‘lishi mumkin)
+    view_els = driver.find_elements(
+        By.XPATH,
+        "//*[self::a or self::button][contains(translate(.,'view job','VIEW JOB'),'VIEW JOB')]"
+    )
+
+    cards = []
+    for el in view_els:
+        try:
+            card = el.find_element(By.XPATH, "ancestor::div[1]/ancestor::div[1]")
+            cards.append((card, el))
+        except Exception:
+            cards.append((None, el))
+    return cards
+
+
+# ===================== RIGHT PANEL =====================
+def extract_right_text(driver) -> str:
     try:
-        # mavjud h1
-        old = driver.find_element(By.XPATH, "//main//h1").text.strip()
+        root = driver.find_element(By.XPATH, "//main")
+        txt = (root.text or "").strip()
+        if txt:
+            return txt
     except Exception:
         pass
-
-    safe_click(driver, link_el)
-    time.sleep(0.25)
-
-    def changed(d):
-        try:
-            t = d.find_element(By.XPATH, "//main//h1").text.strip()
-            return bool(t) and t != old
-        except Exception:
-            return False
-
     try:
-        wait(driver).until(changed)
-    except TimeoutException:
-        wait(driver).until(EC.presence_of_element_located((By.XPATH, "//main//h1")))
+        return (driver.find_element(By.TAG_NAME, "body").text or "").strip()
+    except Exception:
+        return ""
 
 
 def extract_title(driver) -> Optional[str]:
-    # ✅ kuchli selector: main ichidagi h1
-    try:
-        t = driver.find_element(By.XPATH, "//main//h1").text.strip()
-        # "10,000+ jobs" ni title deb olmaslik
-        if t and "jobs" not in t.lower():
-            return t
-    except Exception:
-        pass
-
-    # fallback: eng yaqin h1 lar ichidan "jobs" bo‘lmaganini olamiz
-    try:
-        hs = driver.find_elements(By.XPATH, "//h1")
-        for h in hs:
-            tx = (h.text or "").strip()
-            if tx and "jobs" not in tx.lower():
-                return tx
-    except Exception:
-        pass
-
-    return None
-
-
-def extract_company(driver) -> Optional[str]:
-    # title ustida/ostida company link bo‘ladi
+    # right panel title
     selectors = [
-        "//main//h1/preceding::a[1]",
-        "//main//h1/following::a[1]",
+        "//main//h1",
+        "//h1",
     ]
     for sel in selectors:
         try:
-            tx = driver.find_element(By.XPATH, sel).text.strip()
-            if tx and len(tx) < 200 and "view" not in tx.lower():
-                return tx
+            t = (driver.find_element(By.XPATH, sel).text or "").strip()
+            if t and "jobs" not in t.lower():  # "10,000+ jobs" emas
+                return t
         except Exception:
             pass
     return None
 
 
-def extract_right_text(driver) -> str:
-    try:
-        return driver.find_element(By.XPATH, "//main").text or ""
-    except Exception:
-        return ""
+def company_from_text(detail_text: str) -> Optional[str]:
+    m = re.search(r"\bAt\s+([A-Za-z0-9&.,'’\\- ]{2,80})\b", detail_text)
+    if m:
+        name = m.group(1).strip()
+        name = name.split(" - ")[0].strip()
+        return name
+    return None
+
+
+def extract_company(driver, detail_text: str) -> Optional[str]:
+    # 1) h1 tepasidagi label
+    selectors = [
+        "//main//h1/preceding::*[self::a or self::span][1]",
+        "//main//h1/preceding::a[1]",
+        "//a[contains(@href,'/profiles/')][1]",
+    ]
+    for sel in selectors:
+        try:
+            el = driver.find_element(By.XPATH, sel)
+            tx = (el.text or "").strip()
+            if tx and len(tx) < 120 and tx.lower() not in ("jobs", "companies", "advice", "coaching"):
+                return tx
+        except Exception:
+            pass
+
+    # 2) "At X" regex
+    c = company_from_text(detail_text)
+    if c:
+        return c
+
+    return None
 
 
 def extract_salary(text: str) -> Optional[str]:
-    m = re.search(r"(\$|£|€)\s?\d[\d,]*(\s?-\s?(\$|£|€)\s?\d[\d,]*)?", text)
+    m = re.search(r"(\$|£|€)\s?\d[\d,]*(\s?-\s?(\$|£|€)?\s?\d[\d,]*)?", text)
     return m.group(0).strip() if m else None
 
 
@@ -280,10 +331,8 @@ def detect_job_type(text: str) -> Optional[str]:
         return "Part-time"
     if "contract" in t:
         return "Contract"
-    if "intern" in t:
+    if "intern" in t or "internship" in t:
         return "Internship"
-    if "temporary" in t:
-        return "Temporary"
     return None
 
 
@@ -304,14 +353,48 @@ def extract_skills(text: str) -> Optional[str]:
     skills = [
         "python", "java", "javascript", "typescript", "react", "react native",
         "node", "django", "flask", "fastapi", "sql", "postgres", "mysql",
-        "mongodb", "redis", "aws", "azure", "gcp", "docker", "kubernetes",
+        "mongodb", "redis", "aws", "azure", "gcp", "docker", "kubernetes"
     ]
     t = " " + re.sub(r"\s+", " ", text.lower()) + " "
     found = sorted({s for s in skills if f" {s} " in t})
     return ", ".join(found) if found else None
 
 
-# ===================== SCRAPER =====================
+# ===================== CLICK + TAB PROTECTION =====================
+def click_card_and_wait_detail(driver, el, main_handle: str):
+    # target=_blank bo‘lsa olib tashlaymiz
+    try:
+        driver.execute_script("arguments[0].removeAttribute('target');", el)
+    except Exception:
+        pass
+
+    old_title = ""
+    try:
+        old_title = (driver.find_element(By.XPATH, "//main//h1").text or "").strip()
+    except Exception:
+        pass
+
+    safe_click(driver, el)
+    time.sleep(0.25)
+
+    # tab ochilsa yopamiz
+    close_extra_tabs(driver, main_handle)
+
+    def title_changed(d):
+        try:
+            t = (d.find_element(By.XPATH, "//main//h1").text or "").strip()
+            return t and t != old_title and "jobs" not in t.lower()
+        except Exception:
+            return False
+
+    try:
+        wait(driver).until(title_changed)
+    except TimeoutException:
+        # agar title o‘zgarmasa ham h1 borligini kutamiz
+        wait(driver).until(EC.presence_of_element_located((By.XPATH, "//main//h1")))
+
+
+# ===================== KEYWORDS =====================
 def load_keywords() -> List[str]:
     if not JOBS_PATH.exists():
         raise RuntimeError(f"job_list.json topilmadi: {JOBS_PATH}")
@@ -329,72 +412,72 @@ def load_keywords() -> List[str]:
     raise RuntimeError("job_list.json format topilmadi. List yoki {keywords:[...]} bo‘lsin.")
 
 
+# ===================== SCRAPER =====================
 def scrape_keyword(driver, keyword: str, conn):
     cur = conn.cursor()
-    ensure_table_exists(cur)
+    ensure_table(cur)
     conn.commit()
 
     print(f"\n=== KEYWORD: {keyword} ===")
+    main_handle = driver.current_window_handle
 
     for page in range(1, MAX_PAGES + 1):
         url = build_search_url(keyword, page)
         print(f"[OPEN] {url}")
+
         driver.get(url)
         time.sleep(PAGE_SLEEP)
         close_popups(driver)
 
         try:
-            wait(driver).until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//a[contains(translate(.,'view job','VIEW JOB'),'VIEW JOB')]")
-                )
-            )
+            wait_left_list(driver)
         except TimeoutException:
-            print(f"[STOP] No results or blocked. keyword='{keyword}' page={page}")
+            print(f"[STOP] No results/blocked keyword='{keyword}' page={page}")
             break
 
         batch_rows: List[Dict[str, Any]] = []
-        seen = set()
+        seen_ids = set()
 
         i = 0
         while True:
             close_popups(driver)
-            links = get_view_links(driver)
-            if i >= len(links):
+            close_extra_tabs(driver, main_handle)
+
+            cards = get_left_cards(driver)
+            if i >= len(cards):
                 break
 
             stale_retry = 0
             while stale_retry < MAX_STALE_RETRY:
                 try:
-                    link = links[i]
+                    card, view_el = cards[i]
 
-                    # chap card text (location)
-                    card_text = ""
-                    try:
-                        card = link.find_element(By.XPATH, "ancestor::div[1]/ancestor::div[1]")
-                        card_text = card.text.strip()
-                    except Exception:
-                        pass
+                    card_text = (card.text or "").strip() if card is not None else ""
+                    location = parse_location_from_card_text(card_text)
 
-                    click_and_wait_detail(driver, link)
+                    click_card_and_wait_detail(driver, view_el, main_handle)
                     time.sleep(0.2)
                     close_popups(driver)
+                    close_extra_tabs(driver, main_handle)
 
                     job_url = driver.current_url
                     job_id = parse_job_id_from_url(job_url)
 
-                    if job_id in seen:
+                    if not job_id or job_id in seen_ids:
                         break
-                    seen.add(job_id)
+                    seen_ids.add(job_id)
 
                     detail_text = extract_right_text(driver)
+
+                    title = extract_title(driver)
+                    company = extract_company(driver, detail_text)
 
                     row = {
                         "job_id": job_id,
                         "source": SOURCE_NAME,
-                        "job_title": extract_title(driver),
-                        "company_name": extract_company(driver),
-                        "location": parse_card_location(card_text),
+                        "job_title": title,
+                        "company_name": company,
+                        "location": location,
                         "salary": extract_salary(detail_text),
                         "job_type": detect_job_type(detail_text),
                         "skills": extract_skills(detail_text),
@@ -403,9 +486,8 @@ def scrape_keyword(driver, keyword: str, conn):
                     }
 
                     batch_rows.append(row)
-                    print(f"  [JOB] {row['job_title']} | {row['company_name']} | {row['location']} | id={job_id}")
+                    print(f"  [JOB] {title} | {company} | {location} | id={job_id}")
 
-                    # ✅ HAR JOBDA DB GA YOZADI (BATCH_SIZE=1)
                     if len(batch_rows) >= BATCH_SIZE:
                         flush_to_db(conn, cur, batch_rows)
 
@@ -420,19 +502,19 @@ def scrape_keyword(driver, keyword: str, conn):
                     print("  [ERR]", repr(e))
                     break
 
-            # ✅ eng muhim: i albatta oshishi kerak (qotib qolmasin)
             i += 1
 
-        # page tugadi, qolgan bo‘lsa yozamiz
+        # page tugadi
         try:
             flush_to_db(conn, cur, batch_rows)
         except Exception as e:
             conn.rollback()
             print("[DB ERR]", repr(e))
+            batch_rows.clear()
 
-        print(f"[PAGE DONE] page={page} items_seen={len(seen)}")
-        if len(seen) == 0:
-            print(f"[DONE] no jobs page={page}")
+        print(f"[PAGE DONE] page={page} unique_jobs={len(seen_ids)}")
+        if len(seen_ids) == 0:
+            print(f"[STOP] empty list keyword='{keyword}' page={page}")
             break
 
 
@@ -444,8 +526,9 @@ def main():
     driver = create_driver()
     try:
         for kw in keywords:
-            if kw.strip():
-                scrape_keyword(driver, kw.strip(), conn)
+            kw = kw.strip()
+            if kw:
+                scrape_keyword(driver, kw, conn)
     finally:
         try:
             driver.quit()
