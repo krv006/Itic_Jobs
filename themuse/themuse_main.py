@@ -268,7 +268,7 @@ def extract_title(driver) -> Optional[str]:
 
 
 def company_from_text(detail_text: str) -> Optional[str]:
-    m = re.search(r"\bAt\s+([A-Za-z0-9&.,'’\\- ]{2,80})\b", detail_text)
+    m = re.search(r"\bAt\s+([A-Za-z0-9&.,'’\- ]{2,80})\b", detail_text)
     if m:
         name = m.group(1).strip()
         name = name.split(" - ")[0].strip()
