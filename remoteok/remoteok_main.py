@@ -2,7 +2,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import List, Tuple, Set
+from typing import List, Tuple, Set, Optional
 
 import psycopg2
 from dotenv import load_dotenv
@@ -21,9 +21,11 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 load_dotenv()
 
+# ---------------- PATHS ----------------
 BASE_DIR = Path(__file__).resolve().parent
 JOBS_PATH = Path(os.getenv("JOBS_PATH", str(BASE_DIR / "job_list.json")))
 
+# ---------------- SETTINGS ----------------
 REMOTEOK_URL = os.getenv("REMOTEOK_URL", "https://remoteok.com/")
 SOURCE_NAME = os.getenv("REMOTEOK_SOURCE", "remoteok")
 
@@ -36,6 +38,10 @@ NO_NEW_LIMIT = int(os.getenv("NO_NEW_LIMIT", "4"))
 
 SEARCH_RETRIES = int(os.getenv("SEARCH_RETRIES", "6"))
 KEYWORD_DELAY = float(os.getenv("KEYWORD_DELAY", "1.2"))
+
+# ✅ keyword natijasi umuman o‘zgarmasa reload qilib qayta urinadi
+RESULT_CHANGE_RETRIES = int(os.getenv("RESULT_CHANGE_RETRIES", "3"))
+AFTER_SEARCH_SETTLE = float(os.getenv("AFTER_SEARCH_SETTLE", "0.8"))
 
 
 # ---------------- DB ----------------
@@ -80,9 +86,13 @@ def ensure_table_exists(cur):
     )
 
 
-def insert_rows(conn, rows: List[Tuple]) -> int:
+def insert_rows(conn, rows: List[Tuple]) -> Tuple[int, int]:
+    """
+    returns (new_inserted, skipped_duplicates)
+    """
     if not rows:
-        return 0
+        return 0, 0
+
     sql = """
     INSERT INTO public.remoteok (
         job_id, source, job_title, company_name, location,
@@ -91,15 +101,23 @@ def insert_rows(conn, rows: List[Tuple]) -> int:
     VALUES %s
     ON CONFLICT (job_id, source) DO NOTHING;
     """
+
     with conn.cursor() as cur:
         ensure_table_exists(cur)
+
         cur.execute("SELECT COUNT(*) FROM public.remoteok;")
         before = cur.fetchone()[0]
+
         execute_values(cur, sql, rows, page_size=200)
+
         cur.execute("SELECT COUNT(*) FROM public.remoteok;")
         after = cur.fetchone()[0]
+
     conn.commit()
-    return after - before
+
+    new_inserted = after - before
+    skipped = max(len(rows) - new_inserted, 0)
+    return new_inserted, skipped
 
 
 # ---------------- INPUT ----------------
@@ -110,6 +128,7 @@ def load_keywords() -> List[str]:
     if not isinstance(data, list):
         raise RuntimeError('job_list.json LIST bo‘lishi kerak: ["python","react"]')
 
+    # normalize + unique
     out, seen = [], set()
     for x in data:
         s = str(x).strip()
@@ -158,6 +177,15 @@ def find_search_input(driver):
     raise RuntimeError("Search input topilmadi.")
 
 
+def get_first_visible_job_id(driver) -> Optional[str]:
+    try:
+        row = driver.find_element(By.CSS_SELECTOR, "tr.job")
+        data_id = row.get_attribute("data-id") or ""
+        return f"remoteok_{data_id}" if data_id else None
+    except Exception:
+        return None
+
+
 def clear_and_type(driver, text: str):
     last_err = None
     for _ in range(SEARCH_RETRIES):
@@ -165,19 +193,42 @@ def clear_and_type(driver, text: str):
             el = find_search_input(driver)
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
             time.sleep(0.12)
-
             el.click()
             el.send_keys(Keys.CONTROL, "a")
             el.send_keys(Keys.DELETE)
             el.send_keys(text)
             el.send_keys(Keys.ENTER)
-
             time.sleep(KEYWORD_DELAY)
             return
         except (StaleElementReferenceException, ElementClickInterceptedException, NoSuchElementException) as e:
             last_err = e
             time.sleep(0.5)
     raise last_err if last_err else RuntimeError("Search write failed")
+
+
+def apply_keyword(driver, kw: str) -> None:
+    """
+    Keyword qo‘ygandan keyin natija o‘zgarganini tekshiradi.
+    O‘zgarmasa reload qilib qayta urinadi.
+    """
+    before = get_first_visible_job_id(driver)
+
+    for attempt in range(1, RESULT_CHANGE_RETRIES + 1):
+        clear_and_type(driver, kw)
+        time.sleep(AFTER_SEARCH_SETTLE)
+        after = get_first_visible_job_id(driver)
+
+        # o‘zgardi yoki umuman natija yo‘q bo‘lsa OK
+        if after is None or after != before:
+            return
+
+        # o‘zgarmadi -> reload
+        driver.get(REMOTEOK_URL)
+        wait_ready(driver, 25)
+        time.sleep(0.8)
+
+    # baribir o‘zgarmasa ham davom
+    return
 
 
 def safe_text(el) -> str:
@@ -248,19 +299,31 @@ def extract_job_rows(driver) -> List[Tuple]:
     return out
 
 
-def scroll_collect(driver) -> List[Tuple]:
+def scroll_collect(driver, global_seen_ids: Set[str]) -> List[Tuple]:
+    """
+    ✅ Global dedup: keywordlar orasida ham bir xil job qayta qayta yig‘ilmaydi
+    """
     collected: List[Tuple] = []
-    seen: Set[str] = set()
+    local_seen: Set[str] = set()
+
     no_new = 0
 
     for i in range(MAX_SCROLLS):
         rows = extract_job_rows(driver)
+
         new_count = 0
         for r in rows:
-            if r[0] not in seen:
-                seen.add(r[0])
-                collected.append(r)
-                new_count += 1
+            jid = r[0]
+            if jid in local_seen:
+                continue
+            local_seen.add(jid)
+
+            if jid in global_seen_ids:
+                continue
+            global_seen_ids.add(jid)
+
+            collected.append(r)
+            new_count += 1
 
         if new_count == 0:
             no_new += 1
@@ -290,28 +353,35 @@ def main():
         driver.get(REMOTEOK_URL)
         wait_ready(driver, 25)
 
+        global_seen_ids: Set[str] = set()
+
         total_scraped = 0
         total_new = 0
+        total_skipped = 0
 
         for kw in keywords:
             print(f"\n=== KEYWORD: {kw} ===")
-            clear_and_type(driver, kw)
 
+            apply_keyword(driver, kw)
             driver.execute_script("window.scrollTo(0, 0);")
             time.sleep(0.4)
 
-            rows = scroll_collect(driver)
+            rows = scroll_collect(driver, global_seen_ids)
             print(f"[COLLECT] keyword='{kw}' rows={len(rows)}")
 
-            new = insert_rows(conn, rows)
+            new_inserted, skipped = insert_rows(conn, rows)
+
             total_scraped += len(rows)
-            total_new += new
-            print(f"[DB] keyword='{kw}' new_inserted={new}")
+            total_new += new_inserted
+            total_skipped += skipped
+
+            print(f"[DB] keyword='{kw}' new_inserted={new_inserted} skipped={skipped}")
 
             driver.execute_script("window.scrollTo(0, 0);")
             time.sleep(0.8)
 
-        print(f"\n[DONE] total_scraped_rows={total_scraped} total_new_inserted={total_new}")
+        print(
+            f"\n[DONE] total_scraped_rows={total_scraped} total_new_inserted={total_new} total_skipped={total_skipped}")
 
     except Exception as e:
         try:
