@@ -15,7 +15,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-# ===================== CONFIG =====================
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -29,12 +28,10 @@ HEADLESS = os.getenv("HEADLESS", "false").strip().lower() in ("1", "true", "yes"
 MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))
 PAGE_SLEEP = float(os.getenv("PAGE_SLEEP", "0.6"))
 
-# ✅ tab ko‘paymasin + har jobda yozib boramiz
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
 MAX_STALE_RETRY = int(os.getenv("MAX_STALE_RETRY", "3"))
 
 
-# ===================== DB =====================
 def env_required(key: str) -> str:
     v = os.getenv(key)
     if not v:
@@ -119,7 +116,6 @@ def flush_to_db(conn, cur, batch_rows: List[Dict[str, Any]]):
     batch_rows.clear()
 
 
-# ===================== SELENIUM =====================
 def create_driver():
     options = uc.ChromeOptions()
     if HEADLESS:
@@ -179,7 +175,6 @@ def close_popups(driver):
 
 
 def close_extra_tabs(driver, main_handle: str):
-    # ✅ 10-15 tab bo‘lib ketmasligi uchun eng muhim funksiya
     try:
         handles = driver.window_handles
         for h in handles:
@@ -194,9 +189,7 @@ def close_extra_tabs(driver, main_handle: str):
         pass
 
 
-# ===================== URL / PARSE =====================
 def build_search_url(keyword: str, page: int) -> str:
-    # ✅ slash ham encode bo‘lsin: VR/AR -> VR%2FAR
     kw = urllib.parse.quote(keyword.strip(), safe="")
     return f"{BASE_URL}/keyword/{kw}?page={page}"
 
@@ -214,7 +207,6 @@ def parse_job_id_from_url(url: str) -> str:
 
 
 def parse_location_from_card_text(card_text: str) -> Optional[str]:
-    # "At Company - Remote / Flexible"
     if " - " in card_text:
         loc = card_text.split(" - ", 1)[1].strip()
         loc = re.sub(r"\s+Posted on.*$", "", loc, flags=re.IGNORECASE).strip()
@@ -222,9 +214,7 @@ def parse_location_from_card_text(card_text: str) -> Optional[str]:
     return None
 
 
-# ===================== LEFT LIST (ROBUST) =====================
 def wait_left_list(driver):
-    # ✅ Oldin ishlagan usul: "VIEW JOB" borligini kutamiz
     wait(driver).until(
         EC.presence_of_element_located(
             (By.XPATH, "//*[contains(translate(.,'view job','VIEW JOB'),'VIEW JOB')]")
@@ -233,12 +223,6 @@ def wait_left_list(driver):
 
 
 def get_left_cards(driver) -> List[Tuple[Any, Any]]:
-    """
-    Chap listdagi elementlarni topamiz:
-    - "VIEW JOB" anchor/button ni olamiz
-    - uning card containerini ham topib, location chiqaramiz
-    """
-    # View job linklar (a yoki button bo‘lishi mumkin)
     view_els = driver.find_elements(
         By.XPATH,
         "//*[self::a or self::button][contains(translate(.,'view job','VIEW JOB'),'VIEW JOB')]"
@@ -254,7 +238,6 @@ def get_left_cards(driver) -> List[Tuple[Any, Any]]:
     return cards
 
 
-# ===================== RIGHT PANEL =====================
 def extract_right_text(driver) -> str:
     try:
         root = driver.find_element(By.XPATH, "//main")
@@ -270,7 +253,6 @@ def extract_right_text(driver) -> str:
 
 
 def extract_title(driver) -> Optional[str]:
-    # right panel title
     selectors = [
         "//main//h1",
         "//h1",
@@ -295,7 +277,6 @@ def company_from_text(detail_text: str) -> Optional[str]:
 
 
 def extract_company(driver, detail_text: str) -> Optional[str]:
-    # 1) h1 tepasidagi label
     selectors = [
         "//main//h1/preceding::*[self::a or self::span][1]",
         "//main//h1/preceding::a[1]",
@@ -310,7 +291,6 @@ def extract_company(driver, detail_text: str) -> Optional[str]:
         except Exception:
             pass
 
-    # 2) "At X" regex
     c = company_from_text(detail_text)
     if c:
         return c
@@ -360,9 +340,7 @@ def extract_skills(text: str) -> Optional[str]:
     return ", ".join(found) if found else None
 
 
-# ===================== CLICK + TAB PROTECTION =====================
 def click_card_and_wait_detail(driver, el, main_handle: str):
-    # target=_blank bo‘lsa olib tashlaymiz
     try:
         driver.execute_script("arguments[0].removeAttribute('target');", el)
     except Exception:
@@ -376,8 +354,6 @@ def click_card_and_wait_detail(driver, el, main_handle: str):
 
     safe_click(driver, el)
     time.sleep(0.25)
-
-    # tab ochilsa yopamiz
     close_extra_tabs(driver, main_handle)
 
     def title_changed(d):
@@ -390,11 +366,9 @@ def click_card_and_wait_detail(driver, el, main_handle: str):
     try:
         wait(driver).until(title_changed)
     except TimeoutException:
-        # agar title o‘zgarmasa ham h1 borligini kutamiz
         wait(driver).until(EC.presence_of_element_located((By.XPATH, "//main//h1")))
 
 
-# ===================== KEYWORDS =====================
 def load_keywords() -> List[str]:
     if not JOBS_PATH.exists():
         raise RuntimeError(f"job_list.json topilmadi: {JOBS_PATH}")
@@ -412,7 +386,6 @@ def load_keywords() -> List[str]:
     raise RuntimeError("job_list.json format topilmadi. List yoki {keywords:[...]} bo‘lsin.")
 
 
-# ===================== SCRAPER =====================
 def scrape_keyword(driver, keyword: str, conn):
     cur = conn.cursor()
     ensure_table(cur)
@@ -504,7 +477,6 @@ def scrape_keyword(driver, keyword: str, conn):
 
             i += 1
 
-        # page tugadi
         try:
             flush_to_db(conn, cur, batch_rows)
         except Exception as e:
