@@ -14,22 +14,22 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
-# ================== CONFIG ==================
+# ================== LOAD ENV ==================
 load_dotenv()
 
+# ================== PATHS / CONFIG ==================
 BASE_DIR = Path(__file__).resolve().parent
 JOBS_PATH = Path(os.getenv("JOBS_PATH", str(BASE_DIR / "job_list.json")))
 
 REMOTEOK_URL = "https://remoteok.com/"
 SOURCE_NAME = "remoteok"
 
-MAX_SCROLLS = 80
-SCROLL_PAUSE = 1.2
-NO_NEW_LIMIT = 6
-HEADLESS = False
+MAX_SCROLLS = int(os.getenv("MAX_SCROLLS", "60"))
+SCROLL_PAUSE = float(os.getenv("SCROLL_PAUSE", "0.45"))
+NO_NEW_LIMIT = int(os.getenv("NO_NEW_LIMIT", "3"))
 
 
-# ================== DB ==================
+# ================== ENV HELPERS ==================
 def env_required(key: str) -> str:
     v = os.getenv(key)
     if not v:
@@ -37,6 +37,28 @@ def env_required(key: str) -> str:
     return v
 
 
+def env_bool(key: str, default: bool = False) -> bool:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, str(default)))
+    except Exception:
+        return default
+
+
+# ================== BROWSER SETTINGS (.env) ==================
+HEADLESS = env_bool("HEADLESS", False)
+PAGE_LOAD_TIMEOUT = env_int("PAGE_LOAD_TIMEOUT", 20)
+IMPLICIT_WAIT = env_int("IMPLICIT_WAIT", 5)
+CHROME_WINDOW_SIZE = os.getenv("CHROME_WINDOW_SIZE", "1920,1080")
+
+
+# ================== DB ==================
 def open_db():
     return psycopg2.connect(
         host=env_required("DB_HOST"),
@@ -73,7 +95,10 @@ def ensure_table_exists(conn):
 
 def insert_rows(conn, rows: List[Tuple]) -> Tuple[int, int]:
     """
-    returns: (new_inserted, skipped)
+    FAST insert:
+    - COUNT(*) yo'q
+    - commit faqat insert bo'lsa
+    returns: (inserted_estimate, skipped_estimate)
     """
     if not rows:
         return 0, 0
@@ -88,18 +113,13 @@ def insert_rows(conn, rows: List[Tuple]) -> Tuple[int, int]:
     """
 
     with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM public.remoteok;")
-        before = cur.fetchone()[0]
-
-        execute_values(cur, sql, rows, page_size=300)
-
-        cur.execute("SELECT COUNT(*) FROM public.remoteok;")
-        after = cur.fetchone()[0]
+        execute_values(cur, sql, rows, page_size=500)
+        # rowcount: ba'zan aniq bo'lmasligi mumkin, lekin tez
+        inserted = max(cur.rowcount, 0)
 
     conn.commit()
-    new_inserted = after - before
-    skipped = max(len(rows) - new_inserted, 0)
-    return new_inserted, skipped
+    skipped = max(len(rows) - inserted, 0)
+    return inserted, skipped
 
 
 # ================== KEYWORDS ==================
@@ -124,12 +144,15 @@ def match_keywords(
     # None bo‘lsa ham yiqilmasin
     hay = normalize(" ".join([(title or ""), (company or ""), (location or ""), (skills or "")]))
 
-    if not hay or not keywords:
+    if not keywords:
+        # keyword list bo‘sh bo‘lsa — hammasini qo‘shib yuboramiz
+        return True
+
+    if not hay:
         return False
 
     for kw in keywords:
         tokens = normalize(kw).split()
-        # tokenlar ichidan kamida bittasi matnda bo‘lsa True
         if any(t in hay for t in tokens if len(t) >= 2):
             return True
     return False
@@ -138,19 +161,35 @@ def match_keywords(
 # ================== SELENIUM ==================
 def create_driver():
     opts = webdriver.ChromeOptions()
+
     if HEADLESS:
         opts.add_argument("--headless=new")
-    opts.add_argument("--start-maximized")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
 
-    return webdriver.Chrome(
+    # window size
+    try:
+        width, height = [x.strip() for x in CHROME_WINDOW_SIZE.split(",")]
+    except Exception:
+        width, height = "1920", "1080"
+    opts.add_argument(f"--window-size={width},{height}")
+
+    # stable flags
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+
+    driver = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
         options=opts,
     )
 
+    driver.implicitly_wait(IMPLICIT_WAIT)
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+
+    return driver
+
 
 def wait_ready(driver):
-    WebDriverWait(driver, 30).until(
+    WebDriverWait(driver, PAGE_LOAD_TIMEOUT).until(
         lambda d: d.execute_script("return document.readyState") == "complete"
     )
 
@@ -165,6 +204,7 @@ def safe_text(el) -> str:
 def extract_rows(driver, page: int) -> List[Tuple]:
     rows = []
     trs = driver.find_elements(By.CSS_SELECTOR, "tr.job")
+
     for tr in trs:
         try:
             rid = tr.get_attribute("data-id")
@@ -172,9 +212,18 @@ def extract_rows(driver, page: int) -> List[Tuple]:
                 continue
 
             job_id = f"remoteok_{rid}"
-            title = safe_text(tr.find_element(By.CSS_SELECTOR, "h2")) or None
-            company = safe_text(tr.find_element(By.CSS_SELECTOR, "h3")) or None
 
+            # title/company
+            title = None
+            company = None
+            h2 = tr.find_elements(By.CSS_SELECTOR, "h2")
+            h3 = tr.find_elements(By.CSS_SELECTOR, "h3")
+            if h2:
+                title = safe_text(h2[0]) or None
+            if h3:
+                company = safe_text(h3[0]) or None
+
+            # location/salary
             loc = None
             loc_els = tr.find_elements(By.CSS_SELECTOR, ".location")
             if loc_els:
@@ -185,11 +234,13 @@ def extract_rows(driver, page: int) -> List[Tuple]:
             if sal_els:
                 sal = safe_text(sal_els[0]) or None
 
+            # skills/tags
             tags = tr.find_elements(By.CSS_SELECTOR, ".tags a, .tags span")
             skills_list = [safe_text(t) for t in tags]
             skills_list = [x for x in skills_list if x]
             skills = ", ".join(skills_list) if skills_list else None
 
+            # job_type from skills text
             job_type = None
             if skills:
                 s = skills.lower()
@@ -200,6 +251,7 @@ def extract_rows(driver, page: int) -> List[Tuple]:
                 elif "contract" in s:
                     job_type = "Contract"
 
+            # job url
             link = None
             a_els = tr.find_elements(By.CSS_SELECTOR, "a[href*='/remote-jobs/']")
             if a_els:
@@ -207,36 +259,39 @@ def extract_rows(driver, page: int) -> List[Tuple]:
 
             rows.append(
                 (
-                    job_id,
-                    SOURCE_NAME,
-                    title,
-                    company,
-                    loc,
-                    sal,
-                    job_type,
-                    skills,
-                    None,  # education
-                    link,
-                    page,
+                    job_id,  # 0
+                    SOURCE_NAME,  # 1
+                    title,  # 2
+                    company,  # 3
+                    loc,  # 4
+                    sal,  # 5
+                    job_type,  # 6
+                    skills,  # 7
+                    None,  # 8 education
+                    link,  # 9
+                    page,  # 10
                 )
             )
         except Exception:
             continue
+
     return rows
 
 
-# ================== MAIN LOOP (insert while scrolling) ==================
+# ================== SCRAPE LOOP (insert while scrolling) ==================
 def scroll_collect_and_insert(driver, conn, keywords: List[str]) -> None:
     seen: Set[str] = set()
     no_new = 0
+
     total_unique = 0
+    total_matched = 0
     total_inserted = 0
     total_skipped = 0
 
     for page in range(1, MAX_SCROLLS + 1):
         rows = extract_rows(driver, page)
 
-        # uniq qilib olamiz
+        # only NEW ones for this page
         fresh = []
         for r in rows:
             if r[0] not in seen:
@@ -252,14 +307,16 @@ def scroll_collect_and_insert(driver, conn, keywords: List[str]) -> None:
         else:
             no_new = 0
 
-        # shu pagedagi yangi rowlarni filter qilib darhol DB ga yozamiz
+        # filter
         filtered = [r for r in fresh if match_keywords(r[2], r[3], r[4], r[7], keywords)]
+        matched = len(filtered)
+        total_matched += matched
 
         if filtered:
             new_ins, skipped = insert_rows(conn, filtered)
             total_inserted += new_ins
             total_skipped += skipped
-            print(f"[DB] page={page} matched={len(filtered)} inserted={new_ins} skipped={skipped}")
+            print(f"[DB] page={page} matched={matched} inserted={new_ins} skipped={skipped}")
         else:
             print(f"[FILTER] page={page} matched=0")
 
@@ -270,15 +327,20 @@ def scroll_collect_and_insert(driver, conn, keywords: List[str]) -> None:
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(SCROLL_PAUSE)
 
-    print(f"[DONE] total_unique={total_unique} total_inserted={total_inserted} total_skipped={total_skipped}")
+    print(
+        f"[DONE] total_unique={total_unique} total_matched={total_matched} "
+        f"total_inserted={total_inserted} total_skipped={total_skipped}"
+    )
 
 
+# ================== MAIN ==================
 def main():
     keywords = load_keywords()
     print(f"[KEYWORDS] {len(keywords)} -> {keywords}")
 
     conn = open_db()
     driver = None
+
     try:
         ensure_table_exists(conn)
 
