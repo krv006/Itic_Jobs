@@ -1,94 +1,81 @@
-import json
 import os
+import json
 import time
+import re
 from pathlib import Path
 from typing import List, Tuple, Set, Optional
 
 import psycopg2
-from dotenv import load_dotenv
 from psycopg2.extras import execute_values
+from dotenv import load_dotenv
+
 from selenium import webdriver
-from selenium.common.exceptions import (
-    StaleElementReferenceException,
-    ElementClickInterceptedException,
-    NoSuchElementException,
-)
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 
+
+# ================== CONFIG ==================
 load_dotenv()
 
-# ---------------- PATHS ----------------
 BASE_DIR = Path(__file__).resolve().parent
 JOBS_PATH = Path(os.getenv("JOBS_PATH", str(BASE_DIR / "job_list.json")))
 
-# ---------------- SETTINGS ----------------
-REMOTEOK_URL = os.getenv("REMOTEOK_URL", "https://remoteok.com/")
-SOURCE_NAME = os.getenv("REMOTEOK_SOURCE", "remoteok")
+REMOTEOK_URL = "https://remoteok.com/"
+SOURCE_NAME = "remoteok"
 
-HEADLESS = os.getenv("HEADLESS", "false").lower() in ("1", "true", "yes")
-PAGE_LOAD_TIMEOUT = int(os.getenv("PAGE_LOAD_TIMEOUT", "30"))
-
-MAX_SCROLLS = int(os.getenv("MAX_SCROLLS", "40"))
-SCROLL_PAUSE = float(os.getenv("SCROLL_PAUSE", "1.2"))
-NO_NEW_LIMIT = int(os.getenv("NO_NEW_LIMIT", "4"))
-
-SEARCH_RETRIES = int(os.getenv("SEARCH_RETRIES", "6"))
-KEYWORD_DELAY = float(os.getenv("KEYWORD_DELAY", "1.2"))
-
-# ✅ keyword natijasi umuman o‘zgarmasa reload qilib qayta urinadi
-RESULT_CHANGE_RETRIES = int(os.getenv("RESULT_CHANGE_RETRIES", "3"))
-AFTER_SEARCH_SETTLE = float(os.getenv("AFTER_SEARCH_SETTLE", "0.8"))
+MAX_SCROLLS = 80
+SCROLL_PAUSE = 1.2
+NO_NEW_LIMIT = 6
+HEADLESS = False
 
 
-# ---------------- DB ----------------
-def _env_required(key: str) -> str:
-    val = os.getenv(key)
-    if not val:
-        raise RuntimeError(f".env da {key} topilmadi yoki bo‘sh!")
-    return val
+# ================== DB ==================
+def env_required(key: str) -> str:
+    v = os.getenv(key)
+    if not v:
+        raise RuntimeError(f".env da {key} yo‘q yoki bo‘sh!")
+    return v
 
 
 def open_db():
-    conn = psycopg2.connect(
-        host=_env_required("DB_HOST"),
-        port=int(_env_required("DB_PORT")),
-        dbname=_env_required("DB_NAME"),
-        user=_env_required("DB_USER"),
-        password=_env_required("DB_PASSWORD"),
+    return psycopg2.connect(
+        host=env_required("DB_HOST"),
+        port=int(env_required("DB_PORT")),
+        dbname=env_required("DB_NAME"),
+        user=env_required("DB_USER"),
+        password=env_required("DB_PASSWORD"),
     )
-    conn.autocommit = False
-    return conn
 
 
-def ensure_table_exists(cur):
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS public.remoteok (
-            id BIGSERIAL PRIMARY KEY,
-            job_id VARCHAR(200) NOT NULL,
-            source VARCHAR(50) NOT NULL,
-            job_title VARCHAR(500),
-            company_name VARCHAR(500),
-            location VARCHAR(255),
-            salary VARCHAR(255),
-            job_type VARCHAR(255),
-            skills TEXT,
-            education VARCHAR(255),
-            job_url TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            CONSTRAINT ux_remoteok_jobid_source UNIQUE (job_id, source)
-        );
-        """
-    )
+def ensure_table_exists(conn):
+    sql = """
+    CREATE TABLE IF NOT EXISTS public.remoteok (
+        id BIGSERIAL PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        job_title TEXT,
+        company_name TEXT,
+        location TEXT,
+        salary TEXT,
+        job_type TEXT,
+        skills TEXT,
+        education TEXT,
+        job_url TEXT,
+        page INT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE (job_id, source)
+    );
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
 
 
 def insert_rows(conn, rows: List[Tuple]) -> Tuple[int, int]:
     """
-    returns (new_inserted, skipped_duplicates)
+    returns: (new_inserted, skipped)
     """
     if not rows:
         return 0, 0
@@ -96,139 +83,78 @@ def insert_rows(conn, rows: List[Tuple]) -> Tuple[int, int]:
     sql = """
     INSERT INTO public.remoteok (
         job_id, source, job_title, company_name, location,
-        salary, job_type, skills, education, job_url
+        salary, job_type, skills, education, job_url, page
     )
     VALUES %s
     ON CONFLICT (job_id, source) DO NOTHING;
     """
 
     with conn.cursor() as cur:
-        ensure_table_exists(cur)
-
         cur.execute("SELECT COUNT(*) FROM public.remoteok;")
         before = cur.fetchone()[0]
 
-        execute_values(cur, sql, rows, page_size=200)
+        execute_values(cur, sql, rows, page_size=300)
 
         cur.execute("SELECT COUNT(*) FROM public.remoteok;")
         after = cur.fetchone()[0]
 
     conn.commit()
-
     new_inserted = after - before
     skipped = max(len(rows) - new_inserted, 0)
     return new_inserted, skipped
 
 
-# ---------------- INPUT ----------------
+# ================== KEYWORDS ==================
 def load_keywords() -> List[str]:
     if not JOBS_PATH.exists():
-        raise RuntimeError(f"job_list.json topilmadi: {JOBS_PATH}")
+        return []
     data = json.loads(JOBS_PATH.read_text(encoding="utf-8"))
-    if not isinstance(data, list):
-        raise RuntimeError('job_list.json LIST bo‘lishi kerak: ["python","react"]')
-
-    # normalize + unique
-    out, seen = [], set()
-    for x in data:
-        s = str(x).strip()
-        if not s:
-            continue
-        k = s.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(s)
-    return out
+    return list({str(x).strip().lower() for x in data if str(x).strip()})
 
 
-# ---------------- SELENIUM ----------------
-def create_driver() -> webdriver.Chrome:
-    options = webdriver.ChromeOptions()
+def normalize(s: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def match_keywords(
+    title: Optional[str],
+    company: Optional[str],
+    location: Optional[str],
+    skills: Optional[str],
+    keywords: List[str],
+) -> bool:
+    # None bo‘lsa ham yiqilmasin
+    hay = normalize(" ".join([(title or ""), (company or ""), (location or ""), (skills or "")]))
+
+    if not hay or not keywords:
+        return False
+
+    for kw in keywords:
+        tokens = normalize(kw).split()
+        # tokenlar ichidan kamida bittasi matnda bo‘lsa True
+        if any(t in hay for t in tokens if len(t) >= 2):
+            return True
+    return False
+
+
+# ================== SELENIUM ==================
+def create_driver():
+    opts = webdriver.ChromeOptions()
     if HEADLESS:
-        options.add_argument("--headless=new")
-    options.add_argument("--start-maximized")
-    options.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_argument("--headless=new")
+    opts.add_argument("--start-maximized")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
 
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
-    return driver
-
-
-def wait_ready(driver, timeout=25):
-    WebDriverWait(driver, timeout).until(
-        lambda d: d.execute_script("return document.readyState") == "complete"
+    return webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=opts,
     )
 
 
-def find_search_input(driver):
-    selectors = [
-        (By.CSS_SELECTOR, "input#search"),
-        (By.CSS_SELECTOR, "input[name='search']"),
-        (By.CSS_SELECTOR, "input[type='search']"),
-        (By.CSS_SELECTOR, "input[placeholder*='Search' i]"),
-        (By.CSS_SELECTOR, "input[placeholder*='Type' i]"),
-    ]
-    for by, sel in selectors:
-        els = driver.find_elements(by, sel)
-        if els:
-            return els[0]
-    raise RuntimeError("Search input topilmadi.")
-
-
-def get_first_visible_job_id(driver) -> Optional[str]:
-    try:
-        row = driver.find_element(By.CSS_SELECTOR, "tr.job")
-        data_id = row.get_attribute("data-id") or ""
-        return f"remoteok_{data_id}" if data_id else None
-    except Exception:
-        return None
-
-
-def clear_and_type(driver, text: str):
-    last_err = None
-    for _ in range(SEARCH_RETRIES):
-        try:
-            el = find_search_input(driver)
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-            time.sleep(0.12)
-            el.click()
-            el.send_keys(Keys.CONTROL, "a")
-            el.send_keys(Keys.DELETE)
-            el.send_keys(text)
-            el.send_keys(Keys.ENTER)
-            time.sleep(KEYWORD_DELAY)
-            return
-        except (StaleElementReferenceException, ElementClickInterceptedException, NoSuchElementException) as e:
-            last_err = e
-            time.sleep(0.5)
-    raise last_err if last_err else RuntimeError("Search write failed")
-
-
-def apply_keyword(driver, kw: str) -> None:
-    """
-    Keyword qo‘ygandan keyin natija o‘zgarganini tekshiradi.
-    O‘zgarmasa reload qilib qayta urinadi.
-    """
-    before = get_first_visible_job_id(driver)
-
-    for attempt in range(1, RESULT_CHANGE_RETRIES + 1):
-        clear_and_type(driver, kw)
-        time.sleep(AFTER_SEARCH_SETTLE)
-        after = get_first_visible_job_id(driver)
-
-        # o‘zgardi yoki umuman natija yo‘q bo‘lsa OK
-        if after is None or after != before:
-            return
-
-        # o‘zgarmadi -> reload
-        driver.get(REMOTEOK_URL)
-        wait_ready(driver, 25)
-        time.sleep(0.8)
-
-    # baribir o‘zgarmasa ham davom
-    return
+def wait_ready(driver):
+    WebDriverWait(driver, 30).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
 
 
 def safe_text(el) -> str:
@@ -238,168 +164,138 @@ def safe_text(el) -> str:
         return ""
 
 
-def extract_job_rows(driver) -> List[Tuple]:
-    out: List[Tuple] = []
-    job_rows = driver.find_elements(By.CSS_SELECTOR, "tr.job")
-
-    for row in job_rows:
+def extract_rows(driver, page: int) -> List[Tuple]:
+    rows = []
+    trs = driver.find_elements(By.CSS_SELECTOR, "tr.job")
+    for tr in trs:
         try:
-            data_id = row.get_attribute("data-id") or ""
-            job_id = f"remoteok_{data_id}" if data_id else None
+            rid = tr.get_attribute("data-id")
+            if not rid:
+                continue
 
-            title_el = row.find_elements(By.CSS_SELECTOR, "h2")
-            job_title = safe_text(title_el[0]) if title_el else None
+            job_id = f"remoteok_{rid}"
+            title = safe_text(tr.find_element(By.CSS_SELECTOR, "h2")) or None
+            company = safe_text(tr.find_element(By.CSS_SELECTOR, "h3")) or None
 
-            company_el = row.find_elements(By.CSS_SELECTOR, "h3")
-            company_name = safe_text(company_el[0]) if company_el else None
-
-            location = None
-            loc_els = row.find_elements(By.CSS_SELECTOR, ".location")
+            loc = None
+            loc_els = tr.find_elements(By.CSS_SELECTOR, ".location")
             if loc_els:
-                location = safe_text(loc_els[0]) or None
+                loc = safe_text(loc_els[0]) or None
 
-            salary = None
-            sal_els = row.find_elements(By.CSS_SELECTOR, ".salary")
+            sal = None
+            sal_els = tr.find_elements(By.CSS_SELECTOR, ".salary")
             if sal_els:
-                salary = safe_text(sal_els[0]) or None
+                sal = safe_text(sal_els[0]) or None
 
-            tags = row.find_elements(By.CSS_SELECTOR, ".tags a, .tags span, a.tag")
-            skills = ", ".join([safe_text(t) for t in tags if safe_text(t)]) or None
+            tags = tr.find_elements(By.CSS_SELECTOR, ".tags a, .tags span")
+            skills_list = [safe_text(t) for t in tags]
+            skills_list = [x for x in skills_list if x]
+            skills = ", ".join(skills_list) if skills_list else None
 
             job_type = None
             if skills:
-                low = skills.lower()
-                if "full-time" in low or "full time" in low:
+                s = skills.lower()
+                if "full" in s:
                     job_type = "Full-time"
-                elif "part-time" in low or "part time" in low:
+                elif "part" in s:
                     job_type = "Part-time"
-                elif "contract" in low:
+                elif "contract" in s:
                     job_type = "Contract"
-                elif "freelance" in low:
-                    job_type = "Freelance"
-                elif "intern" in low:
-                    job_type = "Internship"
 
-            job_url = None
-            a_els = row.find_elements(By.CSS_SELECTOR, "a[href*='/remote-jobs/']")
+            link = None
+            a_els = tr.find_elements(By.CSS_SELECTOR, "a[href*='/remote-jobs/']")
             if a_els:
-                href = a_els[0].get_attribute("href")
-                if href and href.startswith("http"):
-                    job_url = href
+                link = a_els[0].get_attribute("href") or None
 
-            if not job_id:
-                job_id = f"remoteok_{(job_title or 'job')}_{(company_name or 'company')}".replace(" ", "_")[:180]
-
-            out.append(
-                (job_id, SOURCE_NAME, job_title, company_name, location, salary, job_type, skills, None, job_url)
+            rows.append(
+                (
+                    job_id,
+                    SOURCE_NAME,
+                    title,
+                    company,
+                    loc,
+                    sal,
+                    job_type,
+                    skills,
+                    None,   # education
+                    link,
+                    page,
+                )
             )
         except Exception:
             continue
+    return rows
 
-    return out
 
-
-def scroll_collect(driver, global_seen_ids: Set[str]) -> List[Tuple]:
-    """
-    ✅ Global dedup: keywordlar orasida ham bir xil job qayta qayta yig‘ilmaydi
-    """
-    collected: List[Tuple] = []
-    local_seen: Set[str] = set()
-
+# ================== MAIN LOOP (insert while scrolling) ==================
+def scroll_collect_and_insert(driver, conn, keywords: List[str]) -> None:
+    seen: Set[str] = set()
     no_new = 0
+    total_unique = 0
+    total_inserted = 0
+    total_skipped = 0
 
-    for i in range(MAX_SCROLLS):
-        rows = extract_job_rows(driver)
+    for page in range(1, MAX_SCROLLS + 1):
+        rows = extract_rows(driver, page)
 
-        new_count = 0
+        # uniq qilib olamiz
+        fresh = []
         for r in rows:
-            jid = r[0]
-            if jid in local_seen:
-                continue
-            local_seen.add(jid)
+            if r[0] not in seen:
+                seen.add(r[0])
+                fresh.append(r)
 
-            if jid in global_seen_ids:
-                continue
-            global_seen_ids.add(jid)
-
-            collected.append(r)
-            new_count += 1
+        new_count = len(fresh)
+        total_unique += new_count
+        print(f"[SCROLL] page={page} total_unique={total_unique} new={new_count}")
 
         if new_count == 0:
             no_new += 1
         else:
             no_new = 0
 
-        print(f"[SCROLL] {i + 1}/{MAX_SCROLLS} total_unique={len(collected)} new={new_count}")
+        # shu pagedagi yangi rowlarni filter qilib darhol DB ga yozamiz
+        filtered = [r for r in fresh if match_keywords(r[2], r[3], r[4], r[7], keywords)]
+
+        if filtered:
+            new_ins, skipped = insert_rows(conn, filtered)
+            total_inserted += new_ins
+            total_skipped += skipped
+            print(f"[DB] page={page} matched={len(filtered)} inserted={new_ins} skipped={skipped}")
+        else:
+            print(f"[FILTER] page={page} matched=0")
 
         if no_new >= NO_NEW_LIMIT:
+            print(f"[STOP] no_new_limit reached ({NO_NEW_LIMIT})")
             break
 
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(SCROLL_PAUSE)
 
-    return collected
+    print(f"[DONE] total_unique={total_unique} total_inserted={total_inserted} total_skipped={total_skipped}")
 
 
 def main():
     keywords = load_keywords()
-    print(f"[KEYWORDS] {len(keywords)} -> {keywords[:10]}{'...' if len(keywords) > 10 else ''}")
+    print(f"[KEYWORDS] {len(keywords)} -> {keywords}")
 
     conn = open_db()
     driver = None
-
     try:
+        ensure_table_exists(conn)
+
         driver = create_driver()
         driver.get(REMOTEOK_URL)
-        wait_ready(driver, 25)
+        wait_ready(driver)
 
-        global_seen_ids: Set[str] = set()
+        scroll_collect_and_insert(driver, conn, keywords)
 
-        total_scraped = 0
-        total_new = 0
-        total_skipped = 0
-
-        for kw in keywords:
-            print(f"\n=== KEYWORD: {kw} ===")
-
-            apply_keyword(driver, kw)
-            driver.execute_script("window.scrollTo(0, 0);")
-            time.sleep(0.4)
-
-            rows = scroll_collect(driver, global_seen_ids)
-            print(f"[COLLECT] keyword='{kw}' rows={len(rows)}")
-
-            new_inserted, skipped = insert_rows(conn, rows)
-
-            total_scraped += len(rows)
-            total_new += new_inserted
-            total_skipped += skipped
-
-            print(f"[DB] keyword='{kw}' new_inserted={new_inserted} skipped={skipped}")
-
-            driver.execute_script("window.scrollTo(0, 0);")
-            time.sleep(0.8)
-
-        print(
-            f"\n[DONE] total_scraped_rows={total_scraped} total_new_inserted={total_new} total_skipped={total_skipped}")
-
-    except Exception as e:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        print("[ERROR]", repr(e))
-        raise
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
         try:
             if driver:
                 driver.quit()
-        except Exception:
-            pass
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":
