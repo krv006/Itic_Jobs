@@ -1,106 +1,128 @@
+import os
+import json
+import time
 import datetime
 import hashlib
-import json
-import os
-import time
 from pathlib import Path
 
-import pyodbc
-import undetected_chromedriver as uc
+import psycopg2
 from dotenv import load_dotenv
+
+import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
+
+# ================== ENV ==================
 load_dotenv()
 
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT")
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+
+
+# ================== PATHS ==================
 BASE_DIR = Path(__file__).resolve().parent
-CONN_PATH = BASE_DIR / "conn.json"
-COOKIES_PATH = BASE_DIR / "cookies.json"
 JOBS_PATH = BASE_DIR / "job_list.json"
+COUNTRIES_PATH = BASE_DIR / "countries.json"
+COOKIES_PATH = BASE_DIR / "cookies.json"
 
 
-def job_hash(title, company, location, date):
-    raw = f"{title}|{company}|{location}|{date}".lower().strip()
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+# ================== DB ==================
+def get_pg_connection():
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+    )
 
 
-def clear_and_type(el, text):
-    el.click()
-    el.send_keys(Keys.CONTROL, "a")
-    el.send_keys(Keys.DELETE)
-    el.send_keys(text)
+def create_table_if_not_exists():
+    query = """
+    CREATE TABLE IF NOT EXISTS glassdoor (
+        id SERIAL PRIMARY KEY,
+        job_hash CHAR(32) UNIQUE NOT NULL,
+        title TEXT,
+        company TEXT,
+        location TEXT,
+        location_sub TEXT,
+        title_sub TEXT,
+        skills TEXT,
+        salary TEXT,
+        date DATE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+    conn = get_pg_connection()
+    cur = conn.cursor()
+    cur.execute(query)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def generate_job_hash(title, company, location):
+    raw = f"{title}|{company}|{location}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
 def save_to_database(title, company, location, location_sub, title_sub, skills, salary, date):
+    job_hash = generate_job_hash(title, company, location)
     conn = None
+
     try:
-        driver = os.getenv("DB_DRIVER")
-        server = os.getenv("DB_SERVER")
-        db_name = os.getenv("DB_NAME")
-        trusted = os.getenv("DB_TRUSTED_CONNECTION", "yes")
+        conn = get_pg_connection()
+        cur = conn.cursor()
 
-        print("DRIVER:", os.getenv("DB_DRIVER"))
-        print("SERVER:", os.getenv("DB_SERVER"))
-        print("DB:", os.getenv("DB_NAME"))
-
-        if not all([driver, server, db_name]):
-            raise ValueError("DB .env variables not fully set")
-
-        conn = pyodbc.connect(
-            f"Driver={driver};"
-            f"Server={server};"
-            f"Database={db_name};"
-            f"Trusted_Connection={trusted};",
-            autocommit=False
-        )
-
-        cursor = conn.cursor()
-        h = job_hash(title, company, location, date)
-
-        cursor.execute(
+        cur.execute(
             """
-            INSERT INTO dbo.Glassdoor (
-                job_hash, title, company, location,
-                location_sub, title_sub, skills,
-                salary, [date]
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO glassdoor
+            (job_hash, title, company, location, location_sub, title_sub, skills, salary, date)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (job_hash) DO NOTHING;
             """,
-            (h, title, company, location, location_sub, title_sub, skills, salary, date)
+            (job_hash, title, company, location, location_sub, title_sub, skills, salary, date)
         )
 
         conn.commit()
-        print(f"✅ Saved: {title} @ {company}")
 
-    except pyodbc.IntegrityError:
-        print(f"⚠️ Duplicate skipped: {title} @ {company}")
+        if cur.rowcount == 0:
+            print(f"⏭️ Duplicate skipped: {title} @ {company}")
+            return False
+
+        print(f"✅ Saved: {title} @ {company}")
+        return True
 
     except Exception as e:
         print(f"❌ DB error: {e}")
+        return False
 
     finally:
         if conn:
             conn.close()
 
 
+# ================== HELPERS ==================
+def clear_and_type(el, text: str):
+    el.click()
+    el.send_keys(Keys.CONTROL, "a")
+    el.send_keys(Keys.DELETE)
+    el.send_keys(text)
+
+
+# ================== SCRAPER ==================
 class GlassdoorScraper:
-    def __init__(self, job, country, driver=None, headless=False):
+    def __init__(self, job: str, country: str, driver):
         self.job = job
         self.country = country
-        self.start = 1
-
-        if driver is None:
-            options = uc.ChromeOptions()
-            options.add_argument("--disable-blink-features=AutomationControlled")
-            options.add_argument("--start-maximized")
-            if headless:
-                options.add_argument("--headless=new")
-            driver = uc.Chrome(options=options)
-
         self.driver = driver
-        self.wait = WebDriverWait(driver, 6)
+        self.wait = WebDriverWait(driver, 5)
         self.wait1 = WebDriverWait(driver, 2)
 
         self.load_cookies()
@@ -111,12 +133,13 @@ class GlassdoorScraper:
         time.sleep(2)
         if COOKIES_PATH.exists():
             with open(COOKIES_PATH, "r", encoding="utf-8") as f:
-                for c in json.load(f):
-                    c.pop("sameSite", None)
-                    try:
-                        self.driver.add_cookie(c)
-                    except:
-                        pass
+                cookies = json.load(f)
+            for c in cookies:
+                c.pop("sameSite", None)
+                try:
+                    self.driver.add_cookie(c)
+                except:
+                    pass
             self.driver.refresh()
             time.sleep(2)
 
@@ -131,44 +154,40 @@ class GlassdoorScraper:
             EC.visibility_of_element_located((By.XPATH, "//input[contains(@aria-labelledby,'location')]"))
         )
 
-        clear_and_type(job_input, f'"{self.job}"')
+        job_query = f'"{self.job}"' if " " in self.job else self.job
+
+        clear_and_type(job_input, job_query)
         clear_and_type(loc_input, self.country)
         loc_input.send_keys(Keys.ENTER)
         time.sleep(2)
 
-        self.driver.get(self.driver.current_url + "&sortBy=date_desc")
+        url = self.driver.current_url
+        self.driver.get(url + ("&sortBy=date_desc" if "?" in url else "?sortBy=date_desc"))
         time.sleep(2)
 
-        self.scroll_and_scrape()
+        self.scroll_and_collect()
 
-    def scroll_and_scrape(self):
+    def scroll_and_collect(self):
         index = 1
-        empty = 0
-        last_count = 0
-
         while True:
-            if not self.scrape_card(index):
+            if not self.scrape_page(index):
                 self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(2)
 
                 cards = self.driver.find_elements(By.XPATH, "//ul[@aria-label='Jobs List']/li")
-                if len(cards) == last_count:
-                    empty += 1
-                else:
-                    empty = 0
-                    last_count = len(cards)
-
-                if empty >= 3:
+                if index > len(cards):
+                    print("✅ Finished scraping")
                     break
             else:
                 index += 1
 
-    def scrape_card(self, i):
+    def scrape_page(self, index: int) -> bool:
         cards = self.driver.find_elements(By.XPATH, "//ul[@aria-label='Jobs List']/li")
-        if i > len(cards):
+        if index > len(cards):
             return False
 
-        base = f"(//ul[@aria-label='Jobs List']/li)[{i}]"
+        base = f"(//ul[@aria-label='Jobs List']/li)[{index}]"
+
         try:
             el = self.wait.until(EC.element_to_be_clickable((By.XPATH, base)))
             self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
@@ -178,9 +197,22 @@ class GlassdoorScraper:
             return False
 
         try:
+            posted_ago = self.wait1.until(
+                EC.presence_of_element_located((By.XPATH, f"{base}//div[contains(@data-test,'job-age')]"))
+            ).text
+        except:
+            posted_ago = ""
+
+        try:
+            location = self.wait1.until(
+                EC.presence_of_element_located((By.XPATH, f"{base}//div[contains(@data-test,'emp-location')]"))
+            ).text
+        except:
+            location = ""
+
+        try:
             company = self.wait1.until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//div[contains(@class,'EmployerProfile_employerNameHeading')]"))
+                EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'EmployerProfile_employerNameHeading')]"))
             ).text
         except:
             company = ""
@@ -193,20 +225,6 @@ class GlassdoorScraper:
             title = ""
 
         try:
-            location = self.wait1.until(
-                EC.presence_of_element_located((By.XPATH, f"{base}//div[contains(@data-test,'emp-location')]"))
-            ).text
-        except:
-            location = ""
-
-        try:
-            posted = self.wait1.until(
-                EC.presence_of_element_located((By.XPATH, f"{base}//div[contains(@data-test,'job-age')]"))
-            ).text.lower()
-        except:
-            posted = ""
-
-        try:
             salary = self.wait1.until(
                 EC.presence_of_element_located((By.XPATH, "//div[contains(@id,'job-salary')]"))
             ).text
@@ -214,40 +232,50 @@ class GlassdoorScraper:
             salary = ""
 
         try:
-            skills = ",".join(x.text for x in self.wait1.until(
-                EC.visibility_of_all_elements_located(
-                    (By.XPATH, "//li[contains(@class,'PendingQualification_pendingQualification')]")
-                )
-            ) if x.text.strip())
+            skills = ",".join([
+                x.text for x in self.wait1.until(
+                    EC.visibility_of_all_elements_located(
+                        (By.XPATH, "//li[contains(@class,'PendingQualification_pendingQualification')]")
+                    )
+                ) if x.text.strip()
+            ])
         except:
             skills = ""
 
         today = datetime.date.today()
-        if "30" in posted:
+        if "30" in posted_ago:
             date = today - datetime.timedelta(days=30)
-        elif "d" in posted:
-            n = "".join(c for c in posted if c.isdigit())
-            date = today - datetime.timedelta(days=int(n or 0))
+        elif "d" in posted_ago.lower():
+            d = int("".join(filter(str.isdigit, posted_ago)))
+            date = today - datetime.timedelta(days=d)
         else:
             date = today
 
-        save_to_database(
-            title, company, location,
-            self.country, self.job,
-            skills, salary, date
-        )
+        save_to_database(title, company, location, self.country, self.job, skills, salary, date)
         return True
 
 
+# ================== RUNNER ==================
 if __name__ == "__main__":
+    create_table_if_not_exists()
+
+    options = uc.ChromeOptions()
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--start-maximized")
+    driver = uc.Chrome(options=options)
+
     with open(JOBS_PATH, "r", encoding="utf-8") as f:
         jobs = json.load(f)
 
-    driver = uc.Chrome()
-    for job in jobs:
-        try:
-            GlassdoorScraper(job, "United States", driver=driver)
-        except Exception as e:
-            print(f"Scrape error: {e}")
+    with open(COUNTRIES_PATH, "r", encoding="utf-8") as f:
+        countries = json.load(f)
+
+    for country in countries:
+        for job in jobs:
+            print(f"\n=== {job} | {country} ===")
+            try:
+                GlassdoorScraper(job, country, driver)
+            except Exception as e:
+                print("❌ Error:", e)
 
     driver.quit()

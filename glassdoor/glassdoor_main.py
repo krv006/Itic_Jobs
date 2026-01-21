@@ -8,22 +8,35 @@ from pathlib import Path
 import psycopg2
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
+from selenium.common.exceptions import (
+    TimeoutException,
+    StaleElementReferenceException,
+    ElementClickInterceptedException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+# -------------------- UC DESTRUCTOR BUG FIX (WINERROR 6) --------------------
+# Windowsda undetected_chromedriver ba'zan process yopilayotganda __del__ ichida
+# yana quit() qilib yuboradi -> WinError 6. Buni butunlay yo'qotamiz.
+try:
+    if hasattr(uc, "Chrome") and hasattr(uc.Chrome, "__del__"):
+        uc.Chrome.__del__ = lambda self: None
+except Exception:
+    pass
+
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
-CONN_PATH = BASE_DIR / "conn.json"
 COOKIES_PATH = BASE_DIR / "cookies.json"
 JOBS_PATH = BASE_DIR / "job_list.json"
 
-# Table create bo'lganini 1 marta belgilab qo'yamiz
 _TABLE_READY = False
 
 
+# ------------------------ HELPERS ------------------------
 def job_hash(title, company, location, date):
     raw = f"{title}|{company}|{location}|{date}".lower().strip()
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -58,47 +71,83 @@ def ensure_table_exists(cur):
 
 def _env_required(key: str) -> str:
     val = os.getenv(key)
-    if val is None:
-        return ""
-    return val.strip()
+    return val.strip() if val else ""
 
 
-def save_to_database(title, company, location, location_sub, title_sub, skills, salary, date):
-    global _TABLE_READY
-    conn = None
+def safe_quit(driver):
+    if not driver:
+        return
     try:
-        # ✅ Senda DB_ nomlar bilan bo'lgani uchun shuni ishlatamiz
+        driver.quit()
+    except Exception:
+        pass
+
+
+def robust_click(driver, wait: WebDriverWait, xpath: str, retries: int = 2) -> bool:
+    last_err = None
+    for _ in range(retries):
+        try:
+            el = wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            el.click()
+            return True
+        except (StaleElementReferenceException, ElementClickInterceptedException, TimeoutException) as e:
+            last_err = e
+            time.sleep(0.25)
+        except Exception as e:
+            last_err = e
+            time.sleep(0.25)
+    if last_err:
+        raise last_err
+    return False
+
+
+# ------------------------ FAST DB (ONE CONNECTION) ------------------------
+class DB:
+    def __init__(self):
+        self.conn = None
+        self.cur = None
+
+    def open(self):
+        global _TABLE_READY
+
         pg_host = _env_required("DB_HOST")
         pg_port = _env_required("DB_PORT") or "5432"
         pg_db = _env_required("DB_NAME")
         pg_user = _env_required("DB_USER")
-        pg_password = _env_required("DB_PASSWORD")  # ✅ bo'sh joylarsiz
+        pg_password = _env_required("DB_PASSWORD")
 
         if not all([pg_host, pg_db, pg_user, pg_password]):
-            raise ValueError(
-                "Postgres .env variables not fully set: DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD"
-            )
+            raise ValueError("Postgres .env variables not fully set: DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD")
 
-        conn = psycopg2.connect(
+        self.conn = psycopg2.connect(
             host=pg_host,
             port=int(pg_port),
             dbname=pg_db,
             user=pg_user,
             password=pg_password,
         )
-        conn.autocommit = False
-        cur = conn.cursor()
+        self.conn.autocommit = False
+        self.cur = self.conn.cursor()
 
-        # ✅ table create faqat 1 marta (process davomida)
         if not _TABLE_READY:
-            ensure_table_exists(cur)
-            conn.commit()
+            ensure_table_exists(self.cur)
+            self.conn.commit()
             _TABLE_READY = True
 
+    def close(self):
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        self.conn = None
+        self.cur = None
+
+    def save(self, title, company, location, location_sub, title_sub, skills, salary, date):
         h = job_hash(title, company, location, date)
 
-        # ✅ insert (duplicate -> skip)
-        cur.execute(
+        self.cur.execute(
             """
             INSERT INTO glassdoor (
                 job_hash, title, company, location,
@@ -108,70 +157,30 @@ def save_to_database(title, company, location, location_sub, title_sub, skills, 
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (job_hash) DO NOTHING
             """,
-            (h, title, company, location, location_sub, title_sub, skills, salary, date)
+            (h, title, company, location, location_sub, title_sub, skills, salary, date),
         )
+        self.conn.commit()
 
-        conn.commit()
-
-        if cur.rowcount == 0:
+        if self.cur.rowcount == 0:
             print(f"⚠️ Duplicate skipped: {title} @ {company}")
         else:
             print(f"✅ Saved: {title} @ {company}")
 
-    except Exception as e:
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        print(f"❌ DB error: {e}")
 
-    finally:
-        if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-
+# ------------------------ SCRAPER ------------------------
 class GlassdoorScraper:
-    def __init__(self, job, country, driver=None, headless=False):
+    def __init__(self, job, country, driver, db: DB):
         self.job = job
         self.country = country
-        self.start = 1
-
-        if driver is None:
-            options = uc.ChromeOptions()
-            options.add_argument("--disable-blink-features=AutomationControlled")
-            options.add_argument("--start-maximized")
-            if headless:
-                options.add_argument("--headless=new")
-            driver = uc.Chrome(options=options)
-
         self.driver = driver
-        self.wait = WebDriverWait(driver, 6)
+        self.db = db
+
+        self.wait = WebDriverWait(driver, 8)
         self.wait1 = WebDriverWait(driver, 2)
-
-        self.load_cookies()
-        self.start_scraping()
-
-    def load_cookies(self):
-        self.driver.get("https://www.glassdoor.com")
-        time.sleep(2)
-        if COOKIES_PATH.exists():
-            with open(COOKIES_PATH, "r", encoding="utf-8") as f:
-                for c in json.load(f):
-                    c.pop("sameSite", None)
-                    try:
-                        self.driver.add_cookie(c)
-                    except Exception:
-                        pass
-            self.driver.refresh()
-            time.sleep(2)
 
     def start_scraping(self):
         self.driver.get("https://www.glassdoor.com/Job")
-        time.sleep(2)
+        time.sleep(0.7)
 
         job_input = self.wait.until(
             EC.visibility_of_element_located((By.XPATH, "//input[contains(@aria-labelledby,'jobTitle')]"))
@@ -183,10 +192,15 @@ class GlassdoorScraper:
         clear_and_type(job_input, f'"{self.job}"')
         clear_and_type(loc_input, self.country)
         loc_input.send_keys(Keys.ENTER)
-        time.sleep(2)
+        time.sleep(0.9)
 
-        self.driver.get(self.driver.current_url + "&sortBy=date_desc")
-        time.sleep(2)
+        # sort by latest
+        cur = self.driver.current_url
+        if "sortBy=" not in cur:
+            self.driver.get(cur + "&sortBy=date_desc")
+        else:
+            self.driver.get(cur.replace("sortBy=relevance", "sortBy=date_desc"))
+        time.sleep(0.8)
 
         self.scroll_and_scrape()
 
@@ -198,7 +212,7 @@ class GlassdoorScraper:
         while True:
             if not self.scrape_card(index):
                 self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(2)
+                time.sleep(1.0)
 
                 cards = self.driver.find_elements(By.XPATH, "//ul[@aria-label='Jobs List']/li")
                 if len(cards) == last_count:
@@ -207,7 +221,8 @@ class GlassdoorScraper:
                     empty = 0
                     last_count = len(cards)
 
-                if empty >= 3:
+                # 3 emas, 2 qilsak tezroq tugaydi
+                if empty >= 2:
                     break
             else:
                 index += 1
@@ -219,22 +234,11 @@ class GlassdoorScraper:
 
         base = f"(//ul[@aria-label='Jobs List']/li)[{i}]"
         try:
-            el = self.wait.until(EC.element_to_be_clickable((By.XPATH, base)))
-            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-            el.click()
-            time.sleep(1)
+            robust_click(self.driver, self.wait, base, retries=2)
         except Exception:
             return False
 
-        try:
-            company = self.wait1.until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//div[contains(@class,'EmployerProfile_employerNameHeading')]")
-                )
-            ).text
-        except Exception:
-            company = ""
-
+        # detail panel title chiqishini minimal kutamiz
         try:
             title = self.wait1.until(
                 EC.presence_of_element_located((By.XPATH, "//h1[contains(@id,'job-title')]"))
@@ -243,36 +247,39 @@ class GlassdoorScraper:
             title = ""
 
         try:
-            location = self.wait1.until(
-                EC.presence_of_element_located((By.XPATH, f"{base}//div[contains(@data-test,'emp-location')]"))
+            company = self.driver.find_element(
+                By.XPATH, "//div[contains(@class,'EmployerProfile_employerNameHeading')]"
+            ).text
+        except Exception:
+            company = ""
+
+        try:
+            location = self.driver.find_element(
+                By.XPATH, f"{base}//div[contains(@data-test,'emp-location')]"
             ).text
         except Exception:
             location = ""
 
         try:
-            posted = self.wait1.until(
-                EC.presence_of_element_located((By.XPATH, f"{base}//div[contains(@data-test,'job-age')]"))
+            posted = self.driver.find_element(
+                By.XPATH, f"{base}//div[contains(@data-test,'job-age')]"
             ).text.lower()
         except Exception:
             posted = ""
 
         try:
-            salary = self.wait1.until(
-                EC.presence_of_element_located((By.XPATH, "//div[contains(@id,'job-salary')]"))
+            salary = self.driver.find_element(
+                By.XPATH, "//div[contains(@id,'job-salary')]"
             ).text
         except Exception:
             salary = ""
 
+        # skills ba'zida sekin, shuning uchun find_elements bilan tezroq
         try:
-            skills = ",".join(
-                x.text
-                for x in self.wait1.until(
-                    EC.visibility_of_all_elements_located(
-                        (By.XPATH, "//li[contains(@class,'PendingQualification_pendingQualification')]")
-                    )
-                )
-                if x.text.strip()
+            skills_elems = self.driver.find_elements(
+                By.XPATH, "//li[contains(@class,'PendingQualification_pendingQualification')]"
             )
+            skills = ",".join(x.text for x in skills_elems if x.text.strip())
         except Exception:
             skills = ""
 
@@ -285,29 +292,61 @@ class GlassdoorScraper:
         else:
             date = today
 
-        save_to_database(
-            title, company, location,
-            self.country, self.job,
-            skills, salary, date
+        self.db.save(
+            title=title,
+            company=company,
+            location=location,
+            location_sub=self.country,
+            title_sub=self.job,
+            skills=skills,
+            salary=salary,
+            date=date,
         )
         return True
 
 
+# ------------------------ MAIN ------------------------
 if __name__ == "__main__":
     with open(JOBS_PATH, "r", encoding="utf-8") as f:
         jobs = json.load(f)
 
-    driver = uc.Chrome()
+    # ✅ driver tezroq ishlashi uchun eager strategy
+    options = uc.ChromeOptions()
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--start-maximized")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--log-level=3")
+    options.page_load_strategy = "eager"  # ✅ TEZ
 
+    driver = uc.Chrome(options=options)
+
+    db = DB()
+    db.open()
+
+    # ✅ cookies faqat 1 marta yuklanadi
     try:
+        driver.get("https://www.glassdoor.com")
+        time.sleep(0.7)
+        if COOKIES_PATH.exists():
+            with open(COOKIES_PATH, "r", encoding="utf-8") as f:
+                for c in json.load(f):
+                    c.pop("sameSite", None)
+                    try:
+                        driver.add_cookie(c)
+                    except Exception:
+                        pass
+            driver.refresh()
+            time.sleep(0.7)
+
         for job in jobs:
             try:
-                GlassdoorScraper(job, "United States", driver=driver)
+                GlassdoorScraper(job, "United States", driver=driver, db=db).start_scraping()
             except Exception as e:
                 print(f"Scrape error: {e}")
+
     finally:
-        # ✅ WinError 6 chiqmasligi uchun "safe quit"
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        db.close()
+        safe_quit(driver)
+        driver = None
