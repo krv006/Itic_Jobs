@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import re
@@ -48,6 +49,12 @@ def open_db():
 
 
 def ensure_table_exists(conn):
+    """
+    ✅ New columns:
+    - posted_at (real time from '7h/2d/1mo')
+    - posted_date
+    - job_subtitle (matched keyword)
+    """
     sql = """
     CREATE TABLE IF NOT EXISTS public.remoteok (
         id BIGSERIAL PRIMARY KEY,
@@ -62,18 +69,25 @@ def ensure_table_exists(conn):
         education TEXT,
         job_url TEXT,
         page INT,
+        posted_at TIMESTAMP NULL,
+        posted_date DATE NULL,
+        job_subtitle TEXT NULL,
         created_at TIMESTAMP DEFAULT NOW(),
         UNIQUE (job_id, source)
     );
     """
     with conn.cursor() as cur:
         cur.execute(sql)
+        # safety for existing tables
+        cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS posted_at TIMESTAMP NULL;")
+        cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS posted_date DATE NULL;")
+        cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS job_subtitle TEXT NULL;")
     conn.commit()
 
 
 def insert_rows(conn, rows: List[Tuple]) -> Tuple[int, int]:
     """
-    returns: (new_inserted, skipped)
+    returns: (inserted_or_updated, skipped_estimate)
     """
     if not rows:
         return 0, 0
@@ -81,25 +95,32 @@ def insert_rows(conn, rows: List[Tuple]) -> Tuple[int, int]:
     sql = """
     INSERT INTO public.remoteok (
         job_id, source, job_title, company_name, location,
-        salary, job_type, skills, education, job_url, page
+        salary, job_type, skills, education, job_url, page,
+        posted_at, posted_date, job_subtitle
     )
     VALUES %s
-    ON CONFLICT (job_id, source) DO NOTHING;
+    ON CONFLICT (job_id, source) DO UPDATE SET
+        job_title    = EXCLUDED.job_title,
+        company_name = EXCLUDED.company_name,
+        location     = EXCLUDED.location,
+        salary       = EXCLUDED.salary,
+        job_type     = EXCLUDED.job_type,
+        skills       = EXCLUDED.skills,
+        education    = EXCLUDED.education,
+        job_url      = EXCLUDED.job_url,
+        page         = EXCLUDED.page,
+        posted_at    = COALESCE(EXCLUDED.posted_at, public.remoteok.posted_at),
+        posted_date  = COALESCE(EXCLUDED.posted_date, public.remoteok.posted_date),
+        job_subtitle = COALESCE(EXCLUDED.job_subtitle, public.remoteok.job_subtitle);
     """
 
     with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM public.remoteok;")
-        before = cur.fetchone()[0]
-
         execute_values(cur, sql, rows, page_size=300)
-
-        cur.execute("SELECT COUNT(*) FROM public.remoteok;")
-        after = cur.fetchone()[0]
-
     conn.commit()
-    new_inserted = after - before
-    skipped = max(len(rows) - new_inserted, 0)
-    return new_inserted, skipped
+
+    # estimate: we can't easily know exact updated vs inserted without RETURNING,
+    # so we return len(rows) as processed and 0 skipped.
+    return len(rows), 0
 
 
 # ================== KEYWORDS ==================
@@ -107,32 +128,46 @@ def load_keywords() -> List[str]:
     if not JOBS_PATH.exists():
         return []
     data = json.loads(JOBS_PATH.read_text(encoding="utf-8"))
-    return list({str(x).strip().lower() for x in data if str(x).strip()})
+    # keep original + lower version for matching
+    kws = []
+    for x in data:
+        s = str(x).strip()
+        if s:
+            kws.append(s)
+    # unique preserve order
+    seen = set()
+    out = []
+    for k in kws:
+        kl = k.lower()
+        if kl not in seen:
+            seen.add(kl)
+            out.append(k)
+    return out
 
 
 def normalize(s: Optional[str]) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
 
-def match_keywords(
-        title: Optional[str],
-        company: Optional[str],
-        location: Optional[str],
-        skills: Optional[str],
-        keywords: List[str],
-) -> bool:
-    # None bo‘lsa ham yiqilmasin
+def find_matching_keyword(
+    title: Optional[str],
+    company: Optional[str],
+    location: Optional[str],
+    skills: Optional[str],
+    keywords: List[str],
+) -> Optional[str]:
+    """
+    ✅ returns the FIRST keyword that matches (job_subtitle)
+    """
     hay = normalize(" ".join([(title or ""), (company or ""), (location or ""), (skills or "")]))
-
     if not hay or not keywords:
-        return False
+        return None
 
     for kw in keywords:
         tokens = normalize(kw).split()
-        # tokenlar ichidan kamida bittasi matnda bo‘lsa True
         if any(t in hay for t in tokens if len(t) >= 2):
-            return True
-    return False
+            return kw  # original keyword text
+    return None
 
 
 # ================== SELENIUM ==================
@@ -162,7 +197,92 @@ def safe_text(el) -> str:
         return ""
 
 
+# ================== POSTED TIME PARSER (7h / 2d / 1mo ...)
+def parse_relative_age(age_text: str) -> Optional[datetime.datetime]:
+    """
+    RemoteOK cards show: '7h', '2d', '1mo', '3y' (sometimes 'm' minutes)
+    We convert to posted_at = now - delta
+    """
+    if not age_text:
+        return None
+
+    t = age_text.strip().lower()
+    t = t.replace(" ", "")
+
+    now = datetime.datetime.now()
+
+    # Examples: 7h, 2d, 1mo, 3y, 45m
+    m = re.match(r"^(\d+)(m|h|d|w|mo|y)$", t)
+    if not m:
+        return None
+
+    n = int(m.group(1))
+    unit = m.group(2)
+
+    if unit == "m":
+        return now - datetime.timedelta(minutes=n)
+    if unit == "h":
+        return now - datetime.timedelta(hours=n)
+    if unit == "d":
+        return now - datetime.timedelta(days=n)
+    if unit == "w":
+        return now - datetime.timedelta(weeks=n)
+    if unit == "mo":
+        # approx month = 30 days
+        return now - datetime.timedelta(days=30 * n)
+    if unit == "y":
+        # approx year = 365 days
+        return now - datetime.timedelta(days=365 * n)
+
+    return None
+
+
+def extract_posted_at_from_tr(tr) -> Optional[datetime.datetime]:
+    """
+    Try to find card time text (e.g. '7h') from the row.
+    RemoteOK layout can vary, so we try multiple selectors.
+    """
+    # Most common: time text in a time cell
+    selectors = [
+        "td.time",           # often contains '7h'
+        ".time",             # fallback
+        "time",              # sometimes time tag
+    ]
+
+    for sel in selectors:
+        try:
+            el = tr.find_element(By.CSS_SELECTOR, sel)
+            txt = safe_text(el)
+            dt = parse_relative_age(txt)
+            if dt:
+                return dt
+        except Exception:
+            continue
+
+    # try attribute-based (sometimes <time datetime="...">)
+    try:
+        t_el = tr.find_element(By.CSS_SELECTOR, "time[datetime]")
+        dt_raw = t_el.get_attribute("datetime")
+        if dt_raw:
+            # try ISO parsing
+            try:
+                # keep simple: YYYY-MM-DDTHH:MM:SSZ
+                dt_raw = dt_raw.replace("Z", "+00:00")
+                return datetime.datetime.fromisoformat(dt_raw).replace(tzinfo=None)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return None
+
+
 def extract_rows(driver, page: int) -> List[Tuple]:
+    """
+    Base rows WITHOUT job_subtitle (it’s added after keyword match)
+    Tuple layout (base):
+      job_id, source, title, company, loc, sal, job_type, skills, education, link, page, posted_at, posted_date
+    """
     rows = []
     trs = driver.find_elements(By.CSS_SELECTOR, "tr.job")
     for tr in trs:
@@ -205,6 +325,9 @@ def extract_rows(driver, page: int) -> List[Tuple]:
             if a_els:
                 link = a_els[0].get_attribute("href") or None
 
+            posted_at = extract_posted_at_from_tr(tr)
+            posted_date = posted_at.date() if posted_at else None
+
             rows.append(
                 (
                     job_id,
@@ -218,6 +341,8 @@ def extract_rows(driver, page: int) -> List[Tuple]:
                     None,  # education
                     link,
                     page,
+                    posted_at,
+                    posted_date,
                 )
             )
         except Exception:
@@ -230,15 +355,14 @@ def scroll_collect_and_insert(driver, conn, keywords: List[str]) -> None:
     seen: Set[str] = set()
     no_new = 0
     total_unique = 0
-    total_inserted = 0
-    total_skipped = 0
+    total_processed = 0
 
     for page in range(1, MAX_SCROLLS + 1):
-        rows = extract_rows(driver, page)
+        base_rows = extract_rows(driver, page)
 
-        # uniq qilib olamiz
+        # uniq
         fresh = []
-        for r in rows:
+        for r in base_rows:
             if r[0] not in seen:
                 seen.add(r[0])
                 fresh.append(r)
@@ -252,14 +376,25 @@ def scroll_collect_and_insert(driver, conn, keywords: List[str]) -> None:
         else:
             no_new = 0
 
-        # shu pagedagi yangi rowlarni filter qilib darhol DB ga yozamiz
-        filtered = [r for r in fresh if match_keywords(r[2], r[3], r[4], r[7], keywords)]
+        # filter + attach job_subtitle (matched keyword)
+        filtered_with_subtitle = []
+        for r in fresh:
+            job_id, source, title, company, loc, sal, job_type, skills, edu, link, pg, posted_at, posted_date = r
+            matched_kw = find_matching_keyword(title, company, loc, skills, keywords)
+            if not matched_kw:
+                continue
 
-        if filtered:
-            new_ins, skipped = insert_rows(conn, filtered)
-            total_inserted += new_ins
-            total_skipped += skipped
-            print(f"[DB] page={page} matched={len(filtered)} inserted={new_ins} skipped={skipped}")
+            filtered_with_subtitle.append(
+                (
+                    job_id, source, title, company, loc, sal, job_type, skills, edu, link, pg,
+                    posted_at, posted_date, matched_kw
+                )
+            )
+
+        if filtered_with_subtitle:
+            processed, _ = insert_rows(conn, filtered_with_subtitle)
+            total_processed += processed
+            print(f"[DB] page={page} matched={len(filtered_with_subtitle)} upserted={processed}")
         else:
             print(f"[FILTER] page={page} matched=0")
 
@@ -270,7 +405,7 @@ def scroll_collect_and_insert(driver, conn, keywords: List[str]) -> None:
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(SCROLL_PAUSE)
 
-    print(f"[DONE] total_unique={total_unique} total_inserted={total_inserted} total_skipped={total_skipped}")
+    print(f"[DONE] total_unique={total_unique} total_upserted={total_processed}")
 
 
 def main():
