@@ -1,6 +1,7 @@
 import datetime
 import json
 import os
+import re
 
 import psycopg2
 import undetected_chromedriver as uc
@@ -10,30 +11,22 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-# ======================
-# LOAD ENV
-# ======================
 load_dotenv()
 
-# ======================
-# DB CONNECTION
-# ======================
 conn = psycopg2.connect(
     host=os.getenv("DB_HOST"),
     port=os.getenv("DB_PORT"),
     dbname=os.getenv("DB_NAME"),
     user=os.getenv("DB_USER"),
-    password=os.getenv("DB_PASSWORD")
+    password=os.getenv("DB_PASSWORD"),
 )
 conn.autocommit = True
 cursor = conn.cursor()
 
 
-# ======================
-# CREATE TABLE
-# ======================
 def create_table_if_not_exists():
-    cursor.execute("""
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS hh (
             job_id TEXT PRIMARY KEY,
             job_title TEXT,
@@ -48,12 +41,10 @@ def create_table_if_not_exists():
             posted_date DATE,
             job_subtitle TEXT
         );
-    """)
+        """
+    )
 
 
-# ======================
-# VALIDATORS
-# ======================
 def is_valid_job_id(job_id: str) -> bool:
     return job_id.isdigit() and len(job_id) >= 6
 
@@ -78,11 +69,9 @@ def is_valid_job_title(title: str) -> bool:
     return not any(bad in title_lower for bad in bad_words)
 
 
-# ======================
-# SAVE DATA
-# ======================
 def save_to_database(data: dict):
-    cursor.execute("""
+    cursor.execute(
+        """
         INSERT INTO hh (
             job_id, job_title, location, skills, salary,
             education, job_type, company_name, job_url,
@@ -90,25 +79,24 @@ def save_to_database(data: dict):
         )
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (job_id) DO NOTHING;
-    """, (
-        data["job_id"],
-        data["job_title"],
-        data["location"],
-        data["skills"],
-        data["salary"],
-        data["education"],
-        data["job_type"],
-        data["company_name"],
-        data["job_url"],
-        data["source"],
-        data["posted_date"],
-        data["job_subtitle"]
-    ))
+        """,
+        (
+            data["job_id"],
+            data["job_title"],
+            data["location"],
+            data["skills"],
+            data["salary"],
+            data["education"],
+            data["job_type"],
+            data["company_name"],
+            data["job_url"],
+            data["source"],
+            data["posted_date"],
+            data["job_subtitle"],
+        ),
+    )
 
 
-# ======================
-# CHROME DRIVER
-# ======================
 def create_driver():
     options = uc.ChromeOptions()
 
@@ -118,23 +106,110 @@ def create_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
-
     return uc.Chrome(options=options)
 
 
-# ======================
-# SAFE TEXT
-# ======================
-def safe_text(driver, xpath):
+def safe_text(driver, xpath: str) -> str:
     try:
         return driver.find_element(By.XPATH, xpath).text.strip()
     except NoSuchElementException:
         return ""
 
 
-# ======================
-# MAIN SCRAPER
-# ======================
+# ----------------------------
+# ✅ HH Posted date parser
+# ----------------------------
+_RU_MONTHS = {
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
+}
+
+
+def parse_posted_date_from_text(text: str) -> datetime.date | None:
+    """
+    Supports:
+    - 'Вакансия опубликована 23 января 2026 ...'
+    - 'Опубликовано: 23 января 2026'
+    - 'сегодня', 'вчера'
+    - '2 дня назад', '5 дней назад', '1 день назад'
+    """
+    if not text:
+        return None
+
+    t = text.strip().lower()
+
+    today = datetime.date.today()
+
+    if "сегодня" in t:
+        return today
+    if "вчера" in t:
+        return today - datetime.timedelta(days=1)
+
+    m = re.search(r"(\d+)\s*(дн(?:я|ей)|день)\s*назад", t)
+    if m:
+        days = int(m.group(1))
+        return today - datetime.timedelta(days=days)
+
+    m = re.search(r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})", t)
+    if m:
+        day = int(m.group(1))
+        mon_name = m.group(2)
+        year = int(m.group(3))
+        mon = _RU_MONTHS.get(mon_name)
+        if mon:
+            return datetime.date(year, mon, day)
+
+    return None
+
+
+def get_hh_posted_date(driver) -> datetime.date:
+    """
+    Tries multiple places: visible text + page_source regex.
+    Falls back to today only if nothing found.
+    """
+    candidates = []
+
+    # HH ko‘pincha shunaqa data-qa lar ishlatadi (turli layoutlarda farq qiladi)
+    xpaths = [
+        "//*[@data-qa='vacancy-view-creation-time']",
+        "//*[contains(text(),'Вакансия опубликована')]",
+        "//*[contains(text(),'Опубликовано')]",
+    ]
+
+    for xp in xpaths:
+        txt = safe_text(driver, xp)
+        if txt:
+            candidates.append(txt)
+
+    # page_source ichidan ham qidiramiz (eng “robust” yo‘l)
+    html = driver.page_source or ""
+    m = re.search(r"(Вакансия опубликована[^<]{0,120})", html, flags=re.IGNORECASE)
+    if m:
+        candidates.append(m.group(1))
+
+    m2 = re.search(r"(Опубликовано[^<]{0,120})", html, flags=re.IGNORECASE)
+    if m2:
+        candidates.append(m2.group(1))
+
+    for c in candidates:
+        dt = parse_posted_date_from_text(c)
+        if dt:
+            return dt
+
+    # fallback (faqat topilmasa)
+    return datetime.date.today()
+
+
 def get_hh_vacancies(jobs_list):
     driver = create_driver()
     wait = WebDriverWait(driver, 20)
@@ -144,10 +219,7 @@ def get_hh_vacancies(jobs_list):
             page = 0
 
             while True:
-                search_url = (
-                    f"https://tashkent.hh.uz/search/vacancy"
-                    f"?text={job}&page={page}"
-                )
+                search_url = f"https://tashkent.hh.uz/search/vacancy?text={job}&page={page}"
                 driver.get(search_url)
 
                 try:
@@ -182,6 +254,8 @@ def get_hh_vacancies(jobs_list):
                     if not is_valid_job_title(job_title):
                         continue
 
+                    posted_date = get_hh_posted_date(driver)
+
                     data = {
                         "job_id": job_id,
                         "job_title": job_title,
@@ -193,12 +267,12 @@ def get_hh_vacancies(jobs_list):
                         "company_name": safe_text(driver, "//div[@data-qa='vacancy-company__details']"),
                         "job_url": url,
                         "source": "hh.uz",
-                        "posted_date": datetime.date.today(),
-                        "job_subtitle": job
+                        "posted_date": posted_date,   # ✅ endi HH dan oladi
+                        "job_subtitle": job,
                     }
 
                     save_to_database(data)
-                    print(f"SAVED: {job_id}")
+                    print(f"SAVED: {job_id} | posted_date={posted_date}")
 
                 page += 1
 
@@ -208,9 +282,6 @@ def get_hh_vacancies(jobs_list):
         conn.close()
 
 
-# ======================
-# ENTRY POINT
-# ======================
 def main():
     create_table_if_not_exists()
 

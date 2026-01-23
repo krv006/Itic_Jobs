@@ -7,8 +7,10 @@ import psycopg2
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
 from selenium.common.exceptions import (
-    TimeoutException, StaleElementReferenceException,
-    ElementClickInterceptedException, NoSuchElementException,
+    TimeoutException,
+    StaleElementReferenceException,
+    ElementClickInterceptedException,
+    NoSuchElementException,
     WebDriverException,
 )
 from selenium.webdriver.common.by import By
@@ -22,7 +24,7 @@ INDEED_HOME = "https://www.indeed.com/"
 DEFAULT_WAIT = 20
 COOKIES_PATH = "indeed_cookies.json"
 
-MAX_STR_LEN = 500
+MAX_STR_LEN = 600
 
 # =========================================================
 # DRIVER
@@ -71,7 +73,7 @@ def open_db():
     )
     conn.autocommit = False
 
-    # Jadvalni yaratish (agar mavjud bo'lmasa)
+    # Jadvalni yaratish / mavjudligini tekshirish
     with conn.cursor() as cur:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS indeed (
@@ -92,7 +94,7 @@ def open_db():
         """)
         conn.commit()
 
-    print("[DB] Jadval 'indeed' tayyor (yoki yaratildi)")
+    print("[DB] Jadval 'indeed' tayyor")
     return conn
 
 
@@ -109,7 +111,7 @@ def save_to_database(
     education: str,
     job_url: str
 ) -> bool:
-    # Uzunlik xatolarini oldini olish uchun kesish
+    # Uzunlikni cheklash
     job_title     = str(job_title or "")[:MAX_STR_LEN]
     company_name  = str(company_name or "")[:MAX_STR_LEN]
     location      = str(location or "")[:MAX_STR_LEN]
@@ -138,7 +140,7 @@ def save_to_database(
                 row = cur.fetchone()
                 print(f"  Saqlandi → ID: {row[0]} | created_at: {row[1]}")
             else:
-                print("  (allaqachon mavjud, saqlanmadi)")
+                print("  (mavjud bo'lgani uchun saqlanmadi)")
         conn.commit()
         return True
     except Exception as e:
@@ -221,16 +223,14 @@ def load_cookies(driver, path=COOKIES_PATH):
 # LOGIN
 # =========================================================
 def login_google(driver):
-    print("[LOGIN] Google orqali kirish urinish")
+    print("[LOGIN] Google orqali urinish")
     driver.get(INDEED_HOME)
     time.sleep(4)
 
-    # Alla qachon kirilganligini tekshirish
     if first_existing(driver, [(By.XPATH, "//*[contains(text(),'Sign out')]")], 7):
         print("→ Alla qachon kirilgan")
         return True
 
-    # Sign in tugmasi
     sign_in = first_existing(driver, [
         (By.XPATH, "//a[contains(., 'Sign in')]"),
         (By.CSS_SELECTOR, "a[href*='auth'], a[href*='signin']"),
@@ -240,7 +240,6 @@ def login_google(driver):
         safe_click(driver, sign_in)
         time.sleep(3.5)
 
-    # Google tugmasi yoki Continue as...
     google_btn = first_existing(driver, [
         (By.XPATH, "//*[contains(., 'Continue with Google') or contains(., 'Google')]"),
     ], 18)
@@ -256,7 +255,6 @@ def login_google(driver):
 
     time.sleep(5)
 
-    # Popup oynasini boshqarish
     original_handles = set(driver.window_handles)
     popup_handle = None
 
@@ -293,7 +291,6 @@ def login_google(driver):
             except:
                 pass
 
-            # Asosiy oynaga qaytish
             if original_handles:
                 driver.switch_to.window(list(original_handles)[0])
             else:
@@ -303,40 +300,70 @@ def login_google(driver):
     driver.refresh()
     time.sleep(3)
 
-    # Tekshirish
     if first_existing(driver, [(By.XPATH, "//*[contains(text(),'Sign out')]")], 10):
         print("[LOGIN] Muvaffaqiyatli!")
         return True
 
-    print("[LOGIN] Muvaffaqiyatsiz (Sign out topilmadi)")
+    print("[LOGIN] Muvaffaqiyatsiz")
     return False
 
 
 # =========================================================
-# JOB MA'LUMOTLARINI O'QISH
+# JOB DETAILS — yangilangan selectorlar (2025-2026 holati)
 # =========================================================
 def read_job_details(driver):
-    time.sleep(1.3)
+    time.sleep(1.5)
 
+    # Company
     company = get_text_safe(first_existing(driver, [
         (By.CSS_SELECTOR, "[data-testid='inlineHeader-companyName']"),
-    ]))
+        (By.CSS_SELECTOR, ".jobsearch-CompanyInfoWithoutHeaderImage span"),
+        (By.CSS_SELECTOR, "div[data-company-name='true'] span"),
+    ], timeout=6))
 
+    # Location
     location = get_text_safe(first_existing(driver, [
         (By.CSS_SELECTOR, "[data-testid='inlineHeader-companyLocation']"),
-    ]))
+        (By.CSS_SELECTOR, ".jobsearch-JobMetadataHeader-item-location"),
+        (By.CSS_SELECTOR, "div[data-test='jobLocation']"),
+    ], timeout=6))
 
+    # Salary
     salary = get_text_safe(first_existing(driver, [
-        (By.CSS_SELECTOR, "[aria-label*='salary'], [class*='salary']"),
-        (By.XPATH, "//*[contains(text(),'$') or contains(text(),'Pay')]"),
-    ], 6))
+        (By.CSS_SELECTOR, "[data-testid='jobsearch-JobMetadataHeader-item-text']"),
+        (By.CSS_SELECTOR, "div[data-testid*='salary'], span[class*='salary']"),
+        (By.CSS_SELECTOR, "[aria-label*='salary'], [aria-label*='Pay']"),
+        (By.XPATH, "//*[contains(text(),'$') or contains(text(),'Pay') or contains(text(),'hour') or contains(text(),'year')]"),
+    ], timeout=8))
 
+    # Job Type
     job_type = get_text_safe(first_existing(driver, [
-        (By.XPATH, "//*[contains(text(),'Job type')]/following-sibling::*"),
-        (By.CSS_SELECTOR, "[class*='jobType']"),
-    ], 6))
+        (By.XPATH, "//*[contains(text(),'Job type')]/following-sibling::* | //*[contains(text(),'Job Type')]/following-sibling::*"),
+        (By.CSS_SELECTOR, "div.jobsearch-JobMetadataHeader-item"),
+        (By.CSS_SELECTOR, "span.jobsearch-JobMetadataHeader-item-text"),
+    ], timeout=7))
 
-    return company, location, salary, job_type, "", ""
+    # Skills & Education — description dan izlash
+    skills = ""
+    education = ""
+
+    desc_el = first_existing(driver, [
+        (By.ID, "jobDescriptionText"),
+        (By.CSS_SELECTOR, ".jobsearch-jobDescriptionText"),
+    ], timeout=6)
+
+    if desc_el:
+        text = get_text_safe(desc_el).lower()
+        # Misollar — o'zingiz kengaytira olasiz
+        design_tools = ["adobe", "photoshop", "illustrator", "figma", "after effects", "premiere", "blender", "unity"]
+        if any(tool in text for tool in design_tools):
+            skills += "Design/Animation tools (Adobe Suite, Figma, etc.), "
+
+        degrees = ["bachelor", "master", "degree", "bsc", "msc", "associate", "diploma"]
+        if any(deg in text for deg in degrees):
+            education += "Higher education likely required"
+
+    return company, location, salary, job_type, skills.strip(", "), education
 
 
 def get_job_id(url: str) -> str:
@@ -375,12 +402,11 @@ def scrape_keyword(driver, conn, keyword: str, max_pages=10):
 
                 if save_to_database(conn, job_id, "indeed.com", title, comp, loc, sal, jtype, sk, edu, job_url):
                     saved_count += 1
-                    print(f"  ✅ {saved_count:3d} | {title[:65]}...")
+                    print(f"  ✅ {saved_count:3d} | {title[:65]}... | salary: {sal[:40]}")
 
             except Exception as ex:
                 print(f"  card xatosi: {str(ex)[:120]}")
 
-        # Keyingi sahifa
         next_btn = first_existing(driver, [
             (By.CSS_SELECTOR, "a[data-testid='pagination-page-next']"),
         ], 7)
@@ -394,7 +420,7 @@ def scrape_keyword(driver, conn, keyword: str, max_pages=10):
 
 
 # =========================================================
-# ASOSIY FUNKSİYA
+# MAIN
 # =========================================================
 def main():
     driver = None
@@ -414,7 +440,6 @@ def main():
 
         conn = open_db()
 
-        # Keywordlar ro'yxati (o'zingiz jobs-list.json dan o'qiy olasiz)
         keywords = ["Animation", "Graphic Designer", "Motion Graphics"]
 
         for kw in keywords:

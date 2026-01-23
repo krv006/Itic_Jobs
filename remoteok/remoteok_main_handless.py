@@ -72,7 +72,6 @@ def open_db():
 def ensure_table_exists(conn):
     sql = """
     CREATE TABLE IF NOT EXISTS public.remoteok (
-        id BIGSERIAL PRIMARY KEY,
         job_id TEXT NOT NULL,
         source TEXT NOT NULL,
         job_title TEXT,
