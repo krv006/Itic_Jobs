@@ -71,6 +71,9 @@ conn.autocommit = True
 cursor = conn.cursor()
 
 
+# ===========================
+# ✅ DB (ADD search_query)
+# ===========================
 def create_table_if_not_exists():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS it_park (
@@ -86,14 +89,22 @@ def create_table_if_not_exists():
             company_name TEXT,
             job_url TEXT,
             description TEXT,
+
+            -- meta subtitle (work_style|experience|employment_type)
             job_subtitle TEXT,
+
+            -- ✅ keyword from job_list.json (search query)
+            search_query TEXT,
+
             posted_date DATE,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE (source, job_id)
         );
     """)
+    cursor.execute("ALTER TABLE it_park ADD COLUMN IF NOT EXISTS search_query TEXT;")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_it_park_source ON it_park (source);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_it_park_posted_date ON it_park (posted_date);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_it_park_search_query ON it_park (search_query);")
     print("[DB] it_park table ready ✅")
 
 
@@ -102,9 +113,9 @@ def save_to_database(data: dict) -> bool:
         INSERT INTO it_park (
             source, job_id, job_title, location, skills, salary,
             education, job_type, company_name, job_url,
-            description, job_subtitle, posted_date
+            description, job_subtitle, search_query, posted_date
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (source, job_id) DO NOTHING;
     """, (
         data["source"],
@@ -118,12 +129,16 @@ def save_to_database(data: dict) -> bool:
         data["company_name"],
         data["job_url"],
         data["description"],
-        data["job_subtitle"],
+        data["job_subtitle"],   # meta subtitle
+        data["search_query"],   # ✅ job_list keyword
         data["posted_date"],
     ))
     return cursor.rowcount == 1
 
 
+# ===========================
+# REQUESTS + SELENIUM
+# ===========================
 def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
@@ -180,9 +195,7 @@ def create_driver():
     driver = webdriver.Chrome(service=service, options=options)
 
     driver.set_page_load_timeout(env_int("PAGE_LOAD_TIMEOUT", 20))
-
     driver.implicitly_wait(env_int("IMPLICIT_WAIT", 5))
-
     return driver
 
 
@@ -195,6 +208,9 @@ def get_soup_selenium(driver, url: str) -> BeautifulSoup | None:
         return None
 
 
+# ===========================
+# PARSING HELPERS
+# ===========================
 def norm(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
@@ -411,7 +427,7 @@ def parse_detail(job_url: str, soup: BeautifulSoup) -> dict:
     meta = extract_meta(lines)
 
     job_type = meta["employment_type"]
-    job_subtitle = " | ".join([x for x in [meta["work_style"], meta["work_experience"], meta["employment_type"]] if x])
+    meta_subtitle = " | ".join([x for x in [meta["work_style"], meta["work_experience"], meta["employment_type"]] if x])
 
     description = parse_section_text(lines, "Description")
     tasks = parse_section_text(lines, "Tasks")
@@ -447,11 +463,16 @@ def parse_detail(job_url: str, soup: BeautifulSoup) -> dict:
         "company_name": company_name,
         "job_url": job_url,
         "description": full_description,
-        "job_subtitle": job_subtitle,
+        "job_subtitle": meta_subtitle,   # meta subtitle
         "posted_date": posted_date,
+        # ✅ search_query will be attached later
+        "search_query": "",
     }
 
 
+# ===========================
+# KEYWORD MATCH (search_query)
+# ===========================
 def keyword_match_text(text: str, keyword: str) -> bool:
     t = (text or "").lower()
     kw = (keyword or "").strip().lower()
@@ -470,14 +491,37 @@ def matched_keywords(job: dict, keywords: list[str]) -> list[str]:
         job.get("job_subtitle", ""),
         job.get("company_name", ""),
     ])
-    return [kw for kw in keywords if keyword_match_text(hay, kw)]
+    hits = [kw for kw in keywords if keyword_match_text(hay, kw)]
+    return hits
 
 
+def pick_primary_query(hits: list[str]) -> str:
+    """
+    ✅ Choose ONE keyword to store.
+    priority: longer keyword first (more specific)
+    """
+    if not hits:
+        return ""
+    hits_sorted = sorted(hits, key=lambda x: len(str(x)), reverse=True)
+    return str(hits_sorted[0]).strip()
+
+
+# ===========================
+# MAIN
+# ===========================
 def main():
     create_table_if_not_exists()
 
     with open("job_list.json", "r", encoding="utf-8") as f:
         keywords = json.load(f)
+
+    # normalize keywords list
+    if isinstance(keywords, dict):
+        for k in ("jobs", "keywords", "list"):
+            if k in keywords and isinstance(keywords[k], list):
+                keywords = keywords[k]
+                break
+    keywords = [str(x).strip() for x in keywords if str(x).strip()]
 
     session = make_session()
     driver = None
@@ -495,7 +539,6 @@ def main():
 
         for url in urls:
             soup = get_soup_requests(session, url)
-
             if soup is None or not soup.select_one("h1"):
                 soup = get_soup_selenium(driver, url)
 
@@ -509,10 +552,13 @@ def main():
             if not hits:
                 continue
 
+            # ✅ attach search_query from job_list.json
+            job["search_query"] = pick_primary_query(hits)
+
             ok = save_to_database(job)
             if ok:
                 inserted += 1
-                print(f"SAVED: {job['job_id']} | {job.get('job_title')} | kw={hits}")
+                print(f"SAVED: {job['job_id']} | {job.get('job_title')} | search_query={job['search_query']} | hits={hits}")
             else:
                 duplicates += 1
                 print(f"DUP: {job['job_id']}")
