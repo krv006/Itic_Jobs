@@ -2,7 +2,8 @@ import datetime
 import json
 import os
 import re
-from urllib.parse import urlparse, parse_qs, unquote_plus
+import time
+from urllib.parse import urlparse, parse_qs, unquote_plus, quote_plus
 
 import psycopg2
 import undetected_chromedriver as uc
@@ -20,6 +21,7 @@ load_dotenv()
 TABLE_NAME = "public.hh"
 DEFAULT_WAIT = 20
 
+
 # ----------------------------
 # FALLBACK ENGLISH NORMALIZER (NO API)
 # Goal: NO Cyrillic remains; use EN mappings where possible
@@ -34,7 +36,6 @@ _RU2LAT = {
     "э": "e", "ю": "yu", "я": "ya",
 }
 
-# RU -> EN dictionary (extend anytime)
 _MAP_EXACT = {
     # locations
     "ташкент": "Tashkent",
@@ -61,7 +62,6 @@ _MAP_EXACT = {
     "до": "up to",
 }
 
-# phrase replacements inside long strings
 _MAP_IN_TEXT = {
     "за месяц": "per month",
     "на руки": "net",
@@ -135,13 +135,11 @@ def to_english(text: str) -> str:
 
     low = s.lower()
 
-    # exact mapping
     if low in _MAP_EXACT:
         res = _MAP_EXACT[low]
         _TEXT_CACHE[s] = res
         return res
 
-    # language-level pattern: "Русский — B2 — Средне-продвинутый"
     m = re.match(r"^\s*([А-Яа-яЁё]+)\s*[—-]\s*(A1|A2|B1|B2|C1|C2)\s*[—-]\s*([А-Яа-яЁё\- ]+)\s*$", s)
     if m:
         lang_ru = m.group(1).strip().lower()
@@ -153,22 +151,18 @@ def to_english(text: str) -> str:
         _TEXT_CACHE[s] = res
         return res
 
-    # replace phrases inside text
     res = s
     for ru, en in _MAP_IN_TEXT.items():
         res = re.sub(re.escape(ru), en, res, flags=re.IGNORECASE)
 
-    # replace simple language words in longer text
     for ru, en in _LANG_MAP.items():
         res = re.sub(rf"\b{re.escape(ru)}\b", en, res, flags=re.IGNORECASE)
     for ru, en in _PROF_MAP.items():
         res = re.sub(rf"\b{re.escape(ru)}\b", en, res, flags=re.IGNORECASE)
 
-    # translit remaining Cyrillic
     if _has_cyrillic(res):
         res = _translit_ru_to_lat(res)
 
-    # cleanup spaces
     res = re.sub(r"\s+", " ", res).strip()
 
     _TEXT_CACHE[s] = res
@@ -186,6 +180,69 @@ def normalize_skills_csv(skills_csv: str) -> str:
             out.append(en)
             seen.add(en)
     return ",".join(out)
+
+
+def normalize_salary_range(s: str) -> str:
+    """
+    Keeps currency at the end if present.
+
+    Examples:
+      "ot 400 000 do 700 000 ₸ per month, net" -> "400 000 - 700 000 ₸"
+      "ot 900 $ per month, net"                -> "900 - $"
+      "do 150 000 ₽ per month, net"            -> "- 150 000 ₽"
+      "150 000 ₽ per month, net"               -> "150 000 ₽"
+      "ot 1 000 do 1 100 Br per month, net"    -> "1 000 - 1 100 Br"
+      ""                                       -> ""
+    """
+    if not s:
+        return ""
+
+    raw = s.strip()
+    if not raw:
+        return ""
+
+    t = raw.lower()
+
+    t = t.replace("from", "ot").replace("up to", "do")
+
+    cur = ""
+    cur_m = re.search(r"(?i)\b(usd|eur|gbp|kzt|rub|uah|byn|br|pln|try|aed|sar|cad|aud|chf|sek|nok|dkk)\b", raw)
+    if cur_m:
+        cur = cur_m.group(1)
+    else:
+        sym_m = re.search(r"[\$€£₽₸]", raw)
+        if sym_m:
+            cur = sym_m.group(0)
+
+    def _num_after(keyword: str) -> str | None:
+        m = re.search(rf"\b{keyword}\b\s*([\d\s]+)", t)
+        if not m:
+            return None
+        n = m.group(1)
+        n = re.sub(r"[^\d\s]", "", n)
+        n = re.sub(r"\s+", " ", n).strip()
+        return n or None
+
+    frm = _num_after("ot")
+    to = _num_after("do")
+
+    if frm and to:
+        out = f"{frm} - {to}"
+    elif frm and not to:
+        out = f"{frm} -"
+    elif to and not frm:
+        out = f"- {to}"
+    else:
+        nums = re.findall(r"\d[\d\s]*\d|\d+", t)
+        nums = [re.sub(r"[^\d\s]", "", n) for n in nums]
+        nums = [re.sub(r"\s+", " ", n).strip() for n in nums if n.strip()]
+        if not nums:
+            return ""
+        out = f"{nums[0]} - {nums[1]}" if len(nums) >= 2 else nums[0]
+
+    if cur:
+        return f"{out} {cur}".strip()
+    return out
 
 
 # ----------------------------
@@ -217,6 +274,7 @@ def create_table_if_not_exists():
             job_url TEXT,
             source TEXT,
             posted_date DATE,
+            created_at TIMESTAMP DEFAULT NOW(),
             job_subtitle TEXT,
             search_query TEXT
         );
@@ -226,7 +284,6 @@ def create_table_if_not_exists():
 
 
 def save_to_database(data: dict):
-    # ✅ UPSERT DO UPDATE (old RU rows become normalized)
     cursor.execute(
         f"""
         INSERT INTO {TABLE_NAME} (
@@ -274,9 +331,11 @@ def create_driver():
     options = uc.ChromeOptions()
     if os.getenv("HEADLESS", "false").lower() == "true":
         options.add_argument("--headless=new")
+
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-blink-features=AutomationControlled")
     return uc.Chrome(options=options)
 
 
@@ -389,6 +448,36 @@ def get_hh_posted_date(driver) -> datetime.date:
 
 
 # ----------------------------
+# SEARCH PAGE URLS (FIX: 2nd job, 3rd job, ...)
+# ----------------------------
+def get_search_result_urls(driver, wait) -> list[str]:
+    """
+    IMPORTANT FIX:
+    - Don't use //a[contains(@class,'magritte-link')] (too broad)
+    - Use only vacancy title links: a[data-qa='serp-item__title']
+    """
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[data-qa='serp-item__title']")))
+    time.sleep(0.2)  # let JS finish rendering more items
+
+    links = driver.find_elements(By.CSS_SELECTOR, "a[data-qa='serp-item__title']")
+    urls = []
+    seen = set()
+
+    for a in links:
+        href = a.get_attribute("href")
+        if not href:
+            continue
+        if "/vacancy/" not in href:
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
+        urls.append(href)
+
+    return urls
+
+
+# ----------------------------
 # SCRAPER
 # ----------------------------
 def get_hh_vacancies(jobs_list):
@@ -401,19 +490,15 @@ def get_hh_vacancies(jobs_list):
         for job in jobs_list:
             page = 0
             while True:
-                search_url = f"https://tashkent.hh.uz/search/vacancy?text={job}&page={page}"
+                q = quote_plus(str(job))
+                search_url = f"https://tashkent.hh.uz/search/vacancy?text={q}&page={page}"
                 driver.get(search_url)
 
                 try:
-                    job_links = wait.until(
-                        EC.presence_of_all_elements_located(
-                            (By.XPATH, "//a[contains(@class,'magritte-link')]")
-                        )
-                    )
+                    urls = get_search_result_urls(driver, wait)
                 except TimeoutException:
                     break
 
-                urls = [a.get_attribute("href") for a in job_links if a.get_attribute("href")]
                 if not urls:
                     break
 
@@ -421,6 +506,8 @@ def get_hh_vacancies(jobs_list):
                     if not isinstance(url, str) or "/vacancy/" not in url:
                         continue
 
+                    # anti-bot: small delay between pages
+                    time.sleep(0.5)
                     driver.get(url)
 
                     job_id = url.split("?")[0].split("/")[-1]
@@ -439,11 +526,10 @@ def get_hh_vacancies(jobs_list):
                     raw_job_type = safe_text(driver, "//div[@data-qa='vacancy-working-hours']")
                     raw_company = safe_text(driver, "//div[@data-qa='vacancy-company__details']")
 
-                    # ✅ Always output Latin/English-like text (NO Cyrillic)
                     job_title = to_english(raw_title)
                     location = to_english(raw_location)
                     skills = normalize_skills_csv(raw_skills)
-                    salary = to_english(raw_salary)
+                    salary = normalize_salary_range(to_english(raw_salary))
                     job_type = to_english(raw_job_type)
                     company_name = to_english(raw_company)
 
@@ -466,7 +552,7 @@ def get_hh_vacancies(jobs_list):
                     }
 
                     save_to_database(data)
-                    print(f"SAVED: {job_id} | posted_date={posted_date} | search_query={search_query}")
+                    print(f"SAVED: {job_id} | posted_date={posted_date} | q={job}")
 
                 page += 1
 

@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 load_dotenv()
 
+# ================== PATH / CONFIG ==================
 BASE_DIR = Path(__file__).resolve().parent
 JOBS_PATH = Path(os.getenv("JOBS_PATH", str(BASE_DIR / "job_list.json")))
 
@@ -28,30 +30,41 @@ HEADLESS = os.getenv("HEADLESS", "false").strip().lower() in ("1", "true", "yes"
 MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))
 PAGE_SLEEP = float(os.getenv("PAGE_SLEEP", "0.6"))
 
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
 MAX_STALE_RETRY = int(os.getenv("MAX_STALE_RETRY", "3"))
 
 
-def env_required(key: str) -> str:
-    v = os.getenv(key)
-    if not v:
-        raise RuntimeError(f".env da {key} topilmadi yoki bo‘sh!")
-    return v
-
-
+# ================== DB ==================
 def open_db():
+    """
+    Supports:
+    - DATABASE_URL
+    - PG_HOST/PG_PORT/PG_DB/PG_USER/PG_PASSWORD
+    - DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD
+    """
     db_url = os.getenv("DATABASE_URL")
     if db_url:
         conn = psycopg2.connect(db_url)
         conn.autocommit = False
         return conn
 
+    host = os.getenv("PG_HOST") or os.getenv("DB_HOST")
+    port = os.getenv("PG_PORT") or os.getenv("DB_PORT") or "5432"
+    dbn = os.getenv("PG_DB") or os.getenv("DB_NAME")
+    usr = os.getenv("PG_USER") or os.getenv("DB_USER")
+    pwd = os.getenv("PG_PASSWORD") or os.getenv("DB_PASSWORD") or ""
+
+    if not host or not dbn or not usr:
+        raise RuntimeError(
+            "DB env yo‘q: DATABASE_URL yoki PG_HOST/PG_DB/PG_USER yoki DB_HOST/DB_NAME/DB_USER to‘ldiring."
+        )
+
     conn = psycopg2.connect(
-        host=env_required("PG_HOST"),
-        port=os.getenv("PG_PORT", "5432"),
-        dbname=env_required("PG_DB"),
-        user=env_required("PG_USER"),
-        password=env_required("PG_PASSWORD"),
+        host=host,
+        port=port,
+        dbname=dbn,
+        user=usr,
+        password=pwd,
     )
     conn.autocommit = False
     return conn
@@ -72,11 +85,19 @@ def ensure_table(cur):
             skills TEXT,
             education VARCHAR(255),
             job_url TEXT,
+
+            job_subtitle TEXT,
+            posted_date DATE,
+
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             CONSTRAINT ux_themuse_jobid_source UNIQUE (job_id, source)
         );
         """
     )
+    cur.execute("ALTER TABLE public.themuse ADD COLUMN IF NOT EXISTS job_subtitle TEXT;")
+    cur.execute("ALTER TABLE public.themuse ADD COLUMN IF NOT EXISTS posted_date DATE;")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_themuse_posted_date ON public.themuse (posted_date);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_themuse_job_subtitle ON public.themuse (job_subtitle);")
 
 
 def upsert_jobs(cur, rows: List[Dict[str, Any]]):
@@ -94,6 +115,8 @@ def upsert_jobs(cur, rows: List[Dict[str, Any]]):
         "skills",
         "education",
         "job_url",
+        "job_subtitle",
+        "posted_date",
     ]
     values = [tuple(r.get(c) for c in cols) for r in rows]
 
@@ -102,7 +125,7 @@ def upsert_jobs(cur, rows: List[Dict[str, Any]]):
         VALUES %s
         ON CONFLICT (job_id, source) DO NOTHING;
     """
-    execute_values(cur, sql, values)
+    execute_values(cur, sql, values, page_size=200)
 
 
 def flush_to_db(conn, cur, batch_rows: List[Dict[str, Any]]):
@@ -110,12 +133,11 @@ def flush_to_db(conn, cur, batch_rows: List[Dict[str, Any]]):
         return
     upsert_jobs(cur, batch_rows)
     conn.commit()
-    cur.execute("SELECT COUNT(*) FROM public.themuse;")
-    total = cur.fetchone()[0]
-    print(f"[DB] inserted_try={len(batch_rows)} total_rows={total}")
+    print(f"[DB] inserted_try={len(batch_rows)}")
     batch_rows.clear()
 
 
+# ================== SELENIUM ==================
 def create_driver():
     options = uc.ChromeOptions()
     if HEADLESS:
@@ -144,7 +166,7 @@ def wait(driver, timeout=DEFAULT_WAIT):
 def safe_click(driver, el) -> bool:
     try:
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        time.sleep(0.1)
+        time.sleep(0.08)
         el.click()
         return True
     except Exception:
@@ -176,8 +198,7 @@ def close_popups(driver):
 
 def close_extra_tabs(driver, main_handle: str):
     try:
-        handles = driver.window_handles
-        for h in handles:
+        for h in driver.window_handles:
             if h != main_handle:
                 try:
                     driver.switch_to.window(h)
@@ -189,6 +210,7 @@ def close_extra_tabs(driver, main_handle: str):
         pass
 
 
+# ================== URL / CARD HELPERS ==================
 def build_search_url(keyword: str, page: int) -> str:
     kw = urllib.parse.quote(keyword.strip(), safe="")
     return f"{BASE_URL}/keyword/{kw}?page={page}"
@@ -207,9 +229,11 @@ def parse_job_id_from_url(url: str) -> str:
 
 
 def parse_location_from_card_text(card_text: str) -> Optional[str]:
+    # Some cards show: "Title - Location Posted ..."
     if " - " in card_text:
         loc = card_text.split(" - ", 1)[1].strip()
         loc = re.sub(r"\s+Posted on.*$", "", loc, flags=re.IGNORECASE).strip()
+        loc = re.sub(r"\s+Posted\s+\d+.*$", "", loc, flags=re.IGNORECASE).strip()
         return loc or None
     return None
 
@@ -253,14 +277,10 @@ def extract_right_text(driver) -> str:
 
 
 def extract_title(driver) -> Optional[str]:
-    selectors = [
-        "//main//h1",
-        "//h1",
-    ]
-    for sel in selectors:
+    for sel in ("//main//h1", "//h1"):
         try:
             t = (driver.find_element(By.XPATH, sel).text or "").strip()
-            if t and "jobs" not in t.lower():  # "10,000+ jobs" emas
+            if t and "jobs" not in t.lower():
                 return t
         except Exception:
             pass
@@ -271,8 +291,7 @@ def company_from_text(detail_text: str) -> Optional[str]:
     m = re.search(r"\bAt\s+([A-Za-z0-9&.,'’\- ]{2,80})\b", detail_text)
     if m:
         name = m.group(1).strip()
-        name = name.split(" - ")[0].strip()
-        return name
+        return name.split(" - ")[0].strip()
     return None
 
 
@@ -290,12 +309,7 @@ def extract_company(driver, detail_text: str) -> Optional[str]:
                 return tx
         except Exception:
             pass
-
-    c = company_from_text(detail_text)
-    if c:
-        return c
-
-    return None
+    return company_from_text(detail_text)
 
 
 def extract_salary(text: str) -> Optional[str]:
@@ -369,6 +383,106 @@ def click_card_and_wait_detail(driver, el, main_handle: str):
         wait(driver).until(EC.presence_of_element_located((By.XPATH, "//main//h1")))
 
 
+# ================== ✅ POSTED DATE PARSER ==================
+_MONTHS = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+
+def parse_posted_date(text: str) -> Optional[datetime.date]:
+    """
+    Examples:
+    - "7h", "Posted 7h ago", "7 hours ago"
+    - "2d", "2 days ago"
+    - "3w", "3 weeks ago"
+    - "1mo", "1 month ago"
+    - "Posted on January 23, 2026"
+    - "Posted on Jan 23, 2026"
+    - "01/23/2026"
+    """
+    if not text:
+        return None
+
+    t = " ".join(text.split()).strip().lower()
+    if not t:
+        return None
+
+    today = datetime.date.today()
+
+    # absolute month name: posted on jan 23, 2026
+    m = re.search(r"posted on\s+([a-z]+)\s+(\d{1,2}),\s*(\d{4})", t, flags=re.I)
+    if m:
+        mon = _MONTHS.get(m.group(1).lower())
+        if mon:
+            try:
+                return datetime.date(int(m.group(3)), mon, int(m.group(2)))
+            except Exception:
+                pass
+
+    # numeric date
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", t)
+    if m:
+        a = int(m.group(1))
+        b = int(m.group(2))
+        y = int(m.group(3))
+        # assume US mm/dd/yyyy first
+        try:
+            return datetime.date(y, a, b)
+        except Exception:
+            try:
+                return datetime.date(y, b, a)
+            except Exception:
+                pass
+
+    # relative hours
+    m = re.search(r"\b(\d+)\s*(h|hr|hrs|hour|hours)\b", t)
+    if m:
+        hours = int(m.group(1))
+        return today - datetime.timedelta(days=(hours // 24))
+
+    # relative days
+    m = re.search(r"\b(\d+)\s*(d|day|days)\b", t)
+    if m:
+        return today - datetime.timedelta(days=int(m.group(1)))
+
+    # relative weeks
+    m = re.search(r"\b(\d+)\s*(w|week|weeks)\b", t)
+    if m:
+        return today - datetime.timedelta(days=int(m.group(1)) * 7)
+
+    # relative months (~30d)
+    m = re.search(r"\b(\d+)\s*(mo|mos|month|months)\b", t)
+    if m:
+        return today - datetime.timedelta(days=int(m.group(1)) * 30)
+
+    if "today" in t:
+        return today
+    if "yesterday" in t:
+        return today - datetime.timedelta(days=1)
+
+    return None
+
+
+def extract_posted_date(card_text: str, detail_text: str) -> datetime.date:
+    for txt in (card_text or "", detail_text or ""):
+        d = parse_posted_date(txt)
+        if d:
+            return d
+    return datetime.date.today()
+
+
+# ================== KEYWORDS ==================
 def load_keywords() -> List[str]:
     if not JOBS_PATH.exists():
         raise RuntimeError(f"job_list.json topilmadi: {JOBS_PATH}")
@@ -386,6 +500,7 @@ def load_keywords() -> List[str]:
     raise RuntimeError("job_list.json format topilmadi. List yoki {keywords:[...]} bo‘lsin.")
 
 
+# ================== SCRAPER ==================
 def scrape_keyword(driver, keyword: str, conn):
     cur = conn.cursor()
     ensure_table(cur)
@@ -424,7 +539,6 @@ def scrape_keyword(driver, keyword: str, conn):
             while stale_retry < MAX_STALE_RETRY:
                 try:
                     card, view_el = cards[i]
-
                     card_text = (card.text or "").strip() if card is not None else ""
                     location = parse_location_from_card_text(card_text)
 
@@ -444,6 +558,7 @@ def scrape_keyword(driver, keyword: str, conn):
 
                     title = extract_title(driver)
                     company = extract_company(driver, detail_text)
+                    posted_date = extract_posted_date(card_text, detail_text)
 
                     row = {
                         "job_id": job_id,
@@ -456,10 +571,14 @@ def scrape_keyword(driver, keyword: str, conn):
                         "skills": extract_skills(detail_text),
                         "education": detect_education(detail_text),
                         "job_url": job_url,
+
+                        # ✅ REQUIRED
+                        "job_subtitle": keyword,
+                        "posted_date": posted_date,
                     }
 
                     batch_rows.append(row)
-                    print(f"  [JOB] {title} | {company} | {location} | id={job_id}")
+                    print(f"  [JOB] {title} | {company} | {location} | posted_date={posted_date} | id={job_id}")
 
                     if len(batch_rows) >= BATCH_SIZE:
                         flush_to_db(conn, cur, batch_rows)
