@@ -15,6 +15,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
+# ✅ offline city->country
+import geonamescache
+import pycountry
+
 # ================== CONFIG ==================
 load_dotenv()
 
@@ -32,19 +36,6 @@ HEADLESS = False
 
 # ================== SALARY NORMALIZER (REMOTEOK: $40k - $120k) ==================
 def normalize_salary_k_range(raw: Optional[str]) -> Optional[str]:
-    """
-    Examples:
-      "💰 $40k - $120k" -> "40 000 - 120 000 $"
-      "$70k - $90k"     -> "70 000 - 90 000 $"
-      "$120k"           -> "120 000 $"
-      "€80k–€140k"      -> "80 000 - 140 000 €"
-      "" / None         -> None
-
-    Notes:
-      - k => *1000
-      - currency is moved to the end
-      - output: "min - max CUR" or "min CUR"
-    """
     if not raw:
         return None
 
@@ -55,6 +46,10 @@ def normalize_salary_k_range(raw: Optional[str]) -> Optional[str]:
     # remove emoji + weird spaces
     s = re.sub(r"[💰\n\r\t]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
+
+    # ignore premium text
+    if "upgrade to premium" in s.lower():
+        return None
 
     # detect currency
     cur = ""
@@ -94,6 +89,127 @@ def normalize_salary_k_range(raw: Optional[str]) -> Optional[str]:
     return out
 
 
+# ================== COUNTRY RESOLVER (CITY -> COUNTRY, OFFLINE) ==================
+gc = geonamescache.GeonamesCache()
+_CITIES = gc.get_cities()
+_COUNTRIES = gc.get_countries()
+
+# city_name_lower -> set(country_code)
+_CITY_TO_CC = {}
+for _id, c in _CITIES.items():
+    name = (c.get("name") or "").strip().lower()
+    cc = (c.get("countrycode") or "").strip().upper()
+    if not name or not cc:
+        continue
+    _CITY_TO_CC.setdefault(name, set()).add(cc)
+
+US_STATE_ABBR = {
+    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id", "il", "in", "ia", "ks", "ky", "la",
+    "me", "md", "ma", "mi", "mn", "ms", "mo", "mt", "ne", "nv", "nh", "nj", "nm", "ny", "nc", "nd", "oh", "ok",
+    "or", "pa", "ri", "sc", "sd", "tn", "tx", "ut", "vt", "va", "wa", "wv", "wi", "wy", "dc"
+}
+
+CA_PROVINCES = {
+    "ontario", "quebec", "british columbia", "alberta", "manitoba", "saskatchewan",
+    "nova scotia", "new brunswick", "newfoundland and labrador", "prince edward island",
+    "northwest territories", "nunavut", "yukon"
+}
+
+def _cc_to_country_name(cc: str) -> Optional[str]:
+    cc = (cc or "").upper().strip()
+    if not cc:
+        return None
+    info = _COUNTRIES.get(cc)
+    if info and info.get("name"):
+        return info["name"]
+    obj = pycountry.countries.get(alpha_2=cc)
+    return obj.name if obj else None
+
+
+def extract_countries_from_location(location: Optional[str]) -> Optional[str]:
+    """
+    Returns: "United States" or "United States; Canada" or "Worldwide" etc.
+    """
+    if not location:
+        return None
+
+    s = location.strip()
+    if not s:
+        return None
+
+    low = s.lower()
+
+    # premium garbage
+    if "upgrade to premium" in low:
+        return None
+
+    # worldwide
+    if "🌏" in s or "worldwide" in low:
+        return "Worldwide"
+
+    # regions
+    regions = []
+    if "europe" in low:
+        regions.append("Europe")
+    if "asia" in low:
+        regions.append("Asia")
+
+    # normalize separators:
+    # "Denver, CO;San Francisco, CA;Toronto, Ontario, CAN"
+    # split by ; then by comma
+    chunks = re.split(r"[;|/]", low)
+    chunks = [c.strip() for c in chunks if c.strip()]
+
+    found_cc = set()
+
+    for chunk in chunks:
+        # further split by comma
+        parts = [p.strip() for p in chunk.split(",") if p.strip()]
+
+        # direct country keywords
+        joined = " ".join(parts)
+        if re.search(r"\b(united states|usa)\b", joined):
+            found_cc.add("US")
+        if re.search(r"\b(united kingdom|uk|england|britain)\b", joined):
+            found_cc.add("GB")
+        if re.search(r"\b(canada|can)\b", joined):
+            found_cc.add("CA")
+
+        # state/province detection
+        for p in parts:
+            if p in US_STATE_ABBR:
+                found_cc.add("US")
+            if p in CA_PROVINCES:
+                found_cc.add("CA")
+
+        # city detection: prefer first city-like part
+        if parts:
+            city_candidate = parts[0].strip()
+            if city_candidate in _CITY_TO_CC:
+                for cc in _CITY_TO_CC[city_candidate]:
+                    found_cc.add(cc)
+
+        # if chunk itself is a city (no commas)
+        if chunk in _CITY_TO_CC:
+            for cc in _CITY_TO_CC[chunk]:
+                found_cc.add(cc)
+
+    # countries -> names
+    countries = [_cc_to_country_name(cc) for cc in sorted(found_cc)]
+    countries = [c for c in countries if c]
+
+    out = []
+    # keep regions first, then countries
+    for r in regions:
+        if r not in out:
+            out.append(r)
+    for c in countries:
+        if c not in out:
+            out.append(c)
+
+    return "; ".join(out) if out else None
+
+
 # ================== DB ==================
 def env_required(key: str) -> str:
     v = os.getenv(key)
@@ -121,6 +237,7 @@ def ensure_table_exists(conn):
         job_title TEXT,
         company_name TEXT,
         location TEXT,
+        country TEXT,
         salary TEXT,
         job_type TEXT,
         skills TEXT,
@@ -140,6 +257,7 @@ def ensure_table_exists(conn):
         cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS posted_date DATE NULL;")
         cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS job_subtitle TEXT NULL;")
         cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS page INT;")
+        cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS country TEXT;")
     conn.commit()
 
 
@@ -149,7 +267,7 @@ def insert_rows(conn, rows: List[Tuple]) -> int:
 
     sql = """
     INSERT INTO public.remoteok (
-        job_id, source, job_title, company_name, location,
+        job_id, source, job_title, company_name, location, country,
         salary, job_type, skills, education, job_url, page,
         posted_at, posted_date, job_subtitle
     )
@@ -158,6 +276,7 @@ def insert_rows(conn, rows: List[Tuple]) -> int:
         job_title    = EXCLUDED.job_title,
         company_name = EXCLUDED.company_name,
         location     = EXCLUDED.location,
+        country      = COALESCE(EXCLUDED.country, public.remoteok.country),
         salary       = EXCLUDED.salary,
         job_type     = EXCLUDED.job_type,
         skills       = EXCLUDED.skills,
@@ -181,7 +300,6 @@ def load_keywords() -> List[str]:
 
     data = json.loads(JOBS_PATH.read_text(encoding="utf-8"))
 
-    # accept list or dict wrapper
     if isinstance(data, dict):
         for k in ("jobs", "keywords", "list"):
             if k in data and isinstance(data[k], list):
@@ -194,7 +312,6 @@ def load_keywords() -> List[str]:
         if s:
             kws.append(s)
 
-    # unique preserve order
     seen = set()
     out = []
     for k in kws:
@@ -206,9 +323,6 @@ def load_keywords() -> List[str]:
 
 
 def keyword_to_remoteok_url(keyword: str) -> str:
-    """
-    "Data Analyst" -> https://remoteok.com/remote-data-analyst-jobs
-    """
     slug = re.sub(r"[^a-z0-9]+", "-", keyword.strip().lower()).strip("-")
     return f"https://remoteok.com/remote-{slug}-jobs"
 
@@ -243,7 +357,7 @@ def safe_text(el) -> str:
         return ""
 
 
-# ================== POSTED TIME PARSER (7h / 2d / 1mo ...) ==================
+# ================== POSTED TIME PARSER ==================
 def parse_relative_age(age_text: str) -> Optional[datetime.datetime]:
     if not age_text:
         return None
@@ -305,7 +419,9 @@ def extract_posted_at_from_tr(tr) -> Optional[datetime.datetime]:
 # ================== ROW EXTRACTION ==================
 def extract_rows(driver, page: int, job_subtitle: str) -> List[Tuple]:
     """
-    Rows: (job_id, source, title, company, loc, sal, job_type, skills, edu, link, page, posted_at, posted_date, job_subtitle)
+    Rows:
+      (job_id, source, title, company, loc, country, sal, job_type,
+       skills, edu, link, page, posted_at, posted_date, job_subtitle)
     """
     rows = []
     trs = driver.find_elements(By.CSS_SELECTOR, "tr.job")
@@ -334,11 +450,13 @@ def extract_rows(driver, page: int, job_subtitle: str) -> List[Tuple]:
             if loc_els:
                 loc = safe_text(loc_els[0]) or None
 
+            # ✅ country from location (city->country)
+            country = extract_countries_from_location(loc)
+
             sal = None
             sal_els = tr.find_elements(By.CSS_SELECTOR, ".salary")
             if sal_els:
                 sal = safe_text(sal_els[0]) or None
-
             sal = normalize_salary_k_range(sal)
 
             tags = tr.find_elements(By.CSS_SELECTOR, ".tags a, .tags span")
@@ -371,15 +489,16 @@ def extract_rows(driver, page: int, job_subtitle: str) -> List[Tuple]:
                     title,
                     company,
                     loc,
+                    country,   # ✅ NEW
                     sal,
                     job_type,
                     skills,
-                    None,  # education
+                    None,
                     link,
                     page,
                     posted_at,
                     posted_date,
-                    job_subtitle,  # ✅ keyword
+                    job_subtitle,
                 )
             )
         except Exception:
@@ -438,7 +557,6 @@ def main():
         ensure_table_exists(conn)
         driver = create_driver()
 
-        # optional warmup
         driver.get(REMOTEOK_URL)
         wait_ready(driver)
 
