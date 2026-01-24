@@ -124,7 +124,6 @@ def ensure_table_exists(conn):
     """
     sql = """
     CREATE TABLE IF NOT EXISTS public.remoteok (
-        id BIGSERIAL PRIMARY KEY,
         job_id TEXT NOT NULL,
         source TEXT NOT NULL,
         job_title TEXT,
@@ -135,11 +134,11 @@ def ensure_table_exists(conn):
         skills TEXT,
         education TEXT,
         job_url TEXT,
-        page INT,
+        job_subtitle TEXT NULL,
         posted_at TIMESTAMP NULL,
         posted_date DATE NULL,
-        job_subtitle TEXT NULL,
         created_at TIMESTAMP DEFAULT NOW(),
+        page INT,
         UNIQUE (job_id, source)
     );
     """
