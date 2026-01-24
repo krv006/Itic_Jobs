@@ -5,43 +5,154 @@ import os
 import re
 import time
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, quote
 
 import psycopg2
+import requests
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+# =========================================================
+# Glassdoor scraper (keyword + countries from JSON)
+# ✅ Collect MANY links, open each detail page
+# ✅ Correct salary extraction + normalization (detail page only)
+# ✅ Auto-translate without API (Google unofficial endpoint)
+# ✅ Saves to Postgres: job_id, job_url, title, company, location, skills, salary, date,
+#          country (location_sub), keyword (title_sub)
+# =========================================================
+
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
-COOKIES_PATH = BASE_DIR / "cookies.json"
-JOBS_PATH = BASE_DIR / "job_list.json"
+JOBS_PATH = Path(os.getenv("JOBS_PATH", str(BASE_DIR / "job_list.json")))
+COUNTRIES_PATH = Path(os.getenv("COUNTRIES_PATH", str(BASE_DIR / "countries.json")))
+COOKIES_PATH = Path(os.getenv("COOKIES_PATH", str(BASE_DIR / "cookies.json")))
 
 BASE_URL = "https://www.glassdoor.com"
+SEARCH_URL = "https://www.glassdoor.com/Job"
+
+DEFAULT_WAIT = int(os.getenv("DEFAULT_WAIT", "18"))
+MAX_SCROLL = int(os.getenv("MAX_SCROLL", "80"))
+SCROLL_PAUSE = float(os.getenv("SCROLL_PAUSE", "1.1"))
+NO_NEW_LIMIT = int(os.getenv("NO_NEW_LIMIT", "3"))
+DETAIL_SLEEP = float(os.getenv("DETAIL_SLEEP", "0.35"))
+BETWEEN_DETAIL_SLEEP = float(os.getenv("BETWEEN_DETAIL_SLEEP", "0.35"))
+
+# Translation throttling (avoid ban)
+TRANSLATE_MIN_INTERVAL = float(os.getenv("TRANSLATE_MIN_INTERVAL", "0.25"))
+
+# Postgres env
+DB_HOST = os.getenv("DB_HOST", "").strip()
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_NAME = os.getenv("DB_NAME", "").strip()
+DB_USER = os.getenv("DB_USER", "").strip()
+DB_PASSWORD = os.getenv("DB_PASSWORD", "").strip()
+
 _TABLE_READY = False
 
+# -------------------------
+# Shared HTTP session (translate)
+# -------------------------
+HTTP = requests.Session()
+HTTP.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+})
 
-# =========================
+# =========================================================
+# TRANSLATION (NO API) + CACHE
+# =========================================================
+_TRANSLATE_CACHE: dict[str, str] = {}
+_last_translate_ts = 0.0
+
+
+def contains_non_latin(text: str) -> bool:
+    """
+    Detect if string has CJK/Hangul/Kana etc (non-latin scripts).
+    """
+    if not text:
+        return False
+    return bool(re.search(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]", text))
+
+
+def translate_to_en_no_api(text: str) -> str:
+    """
+    Google Translate unofficial endpoint (no API key)
+    If fails -> returns original text
+    """
+    global _last_translate_ts
+
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    # only translate if looks non-latin
+    if not contains_non_latin(t):
+        return t
+
+    if t in _TRANSLATE_CACHE:
+        return _TRANSLATE_CACHE[t]
+
+    # throttle
+    now = time.time()
+    wait = TRANSLATE_MIN_INTERVAL - (now - _last_translate_ts)
+    if wait > 0:
+        time.sleep(wait)
+
+    try:
+        q = quote(t)
+        url = (
+            "https://translate.googleapis.com/translate_a/single"
+            f"?client=gtx&sl=auto&tl=en&dt=t&q={q}"
+        )
+        r = HTTP.get(url, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        out = "".join(x[0] for x in data[0] if x and x[0])
+        out = (out or t).strip()
+
+        _TRANSLATE_CACHE[t] = out
+        _last_translate_ts = time.time()
+        return out
+    except Exception:
+        _last_translate_ts = time.time()
+        return t
+
+
+def ensure_english(text: str) -> str:
+    """
+    Force translate if CJK/Hangul exists, otherwise return as-is.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if contains_non_latin(t):
+        return translate_to_en_no_api(t)
+    return t
+
+
+# =========================================================
 # SALARY NORMALIZER
-# =========================
+# =========================================================
 def _fmt_int_spaces(n: int) -> str:
     return f"{n:,}".replace(",", " ")
 
+
 def _detect_period(text: str) -> str:
     t = (text or "").lower()
-    # keep order: year > month > hour
-    if "/year" in t or "per year" in t or " a year" in t or "/yr" in t or "year" in t:
+    if "year" in t or "/yr" in t or "per year" in t or re.search(r"\byr\b", t):
         return "year"
-    if "/month" in t or "per month" in t or " a month" in t or "/mo" in t or "month" in t:
+    if "month" in t or "/mo" in t or "per month" in t or re.search(r"\bmo\b", t):
         return "month"
-    if "/hour" in t or "per hour" in t or "/hr" in t or "hour" in t:
+    if "hour" in t or "/hr" in t or "per hour" in t or re.search(r"\bhr\b", t):
         return "hour"
     return ""
+
 
 def _detect_currency(text: str) -> str:
     if not text:
@@ -54,14 +165,13 @@ def _detect_currency(text: str) -> str:
         return m.group(1).upper()
     return ""
 
+
 def _parse_money_token(tok: str) -> int | None:
     if not tok:
         return None
-    s = tok.strip()
-    s = s.replace(",", "").replace(" ", "")
+    s = tok.strip().replace(",", "").replace(" ", "")
     s = re.sub(r"^[\$€£₽₸]", "", s)
 
-    # 76,000 or 76K or 76.5K
     m = re.match(r"^(\d+(?:\.\d+)?)(k|K)?$", s)
     if not m:
         return None
@@ -70,23 +180,30 @@ def _parse_money_token(tok: str) -> int | None:
         num *= 1000.0
     return int(round(num))
 
+
 def normalize_glassdoor_salary(raw: str) -> str:
+    """
+    ✅ Fixes:
+      - If no currency => return ""
+      - Filters very small numbers (< 10)
+      - Keeps / period if detected
+    """
     if not raw:
         return ""
     s = raw.strip()
     if not s:
         return ""
 
-    # unify dash
     s = s.replace("–", "-").replace("—", "-")
-    # remove bracket notes: (Employer provided) etc
-    s = re.sub(r"\(.*?\)", "", s)
+    s = re.sub(r"\(.*?\)", "", s)  # remove "(Employer provided)" etc
     s = re.sub(r"\s+", " ", s).strip()
 
     cur = _detect_currency(s)
     period = _detect_period(s)
 
-    # remove period words for numeric parse
+    if not cur:
+        return ""
+
     s_clean = re.sub(
         r"(?i)(/year|per year|a year|/yr|year|/month|per month|a month|/mo|month|/hour|per hour|/hr|hour)",
         " ",
@@ -94,7 +211,6 @@ def normalize_glassdoor_salary(raw: str) -> str:
     )
     s_clean = re.sub(r"\s+", " ", s_clean).strip()
 
-    # capture money tokens: "$76,000", "84K", "$58", "72"
     tokens = re.findall(r"[\$€£₽₸]?\d[\d, ]*(?:\.\d+)?\s*[kK]?", s_clean)
     tokens = [t.strip() for t in tokens if t.strip()]
 
@@ -104,6 +220,7 @@ def normalize_glassdoor_salary(raw: str) -> str:
         if n is not None:
             nums.append(n)
 
+    nums = [n for n in nums if n >= 10]
     if not nums:
         return ""
 
@@ -112,42 +229,36 @@ def normalize_glassdoor_salary(raw: str) -> str:
     else:
         out = f"{_fmt_int_spaces(nums[0])}"
 
-    if cur:
-        out = f"{out} {cur}".strip()
+    out = f"{out} {cur}".strip()
     if period:
         out = f"{out} / {period}".strip()
-
     return out
 
 
-# =========================
+# =========================================================
 # HASH
-# =========================
-def job_hash(title, company, location, date):
+# =========================================================
+def job_hash(title: str, company: str, location: str, date: datetime.date) -> str:
     raw = f"{title}|{company}|{location}|{date}".lower().strip()
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-# =========================
+# =========================================================
 # DB
-# =========================
-def _env_required(key: str) -> str:
-    v = os.getenv(key)
-    return v.strip() if v else ""
-
+# =========================================================
 def ensure_table_exists(cur):
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS glassdoor (
+        CREATE TABLE IF NOT EXISTS public.glassdoor (
             id BIGSERIAL PRIMARY KEY,
-            job_id TEXT UNIQUE,
+            job_id TEXT,
             job_url TEXT,
             job_hash CHAR(64) UNIQUE NOT NULL,
             title TEXT,
             company TEXT,
             location TEXT,
-            location_sub TEXT,
-            title_sub TEXT,
+            location_sub TEXT,  -- country
+            title_sub TEXT,     -- keyword
             skills TEXT,
             salary TEXT,
             date DATE,
@@ -155,8 +266,15 @@ def ensure_table_exists(cur):
         );
         """
     )
-    cur.execute("ALTER TABLE glassdoor ADD COLUMN IF NOT EXISTS job_id TEXT;")
-    cur.execute("ALTER TABLE glassdoor ADD COLUMN IF NOT EXISTS job_url TEXT;")
+    cur.execute("ALTER TABLE public.glassdoor ADD COLUMN IF NOT EXISTS job_id TEXT;")
+    cur.execute("ALTER TABLE public.glassdoor ADD COLUMN IF NOT EXISTS job_url TEXT;")
+    cur.execute("ALTER TABLE public.glassdoor ADD COLUMN IF NOT EXISTS location_sub TEXT;")
+    cur.execute("ALTER TABLE public.glassdoor ADD COLUMN IF NOT EXISTS title_sub TEXT;")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_glassdoor_job_id ON public.glassdoor(job_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_glassdoor_country ON public.glassdoor(location_sub);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_glassdoor_keyword ON public.glassdoor(title_sub);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_glassdoor_date ON public.glassdoor(date);")
+
 
 class DB:
     def __init__(self):
@@ -165,12 +283,11 @@ class DB:
 
     def open(self):
         global _TABLE_READY
+        if not all([DB_HOST, DB_NAME, DB_USER, DB_PASSWORD]):
+            raise RuntimeError("DB env not set fully: DB_HOST, DB_NAME, DB_USER, DB_PASSWORD (and optional DB_PORT)")
+
         self.conn = psycopg2.connect(
-            host=_env_required("DB_HOST"),
-            port=int(_env_required("DB_PORT") or "5432"),
-            dbname=_env_required("DB_NAME"),
-            user=_env_required("DB_USER"),
-            password=_env_required("DB_PASSWORD"),
+            host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD
         )
         self.conn.autocommit = False
         self.cur = self.conn.cursor()
@@ -188,11 +305,23 @@ class DB:
         self.conn = None
         self.cur = None
 
-    def save(self, job_id, job_url, title, company, location, location_sub, title_sub, skills, salary, date):
+    def save(
+        self,
+        job_id: str,
+        job_url: str,
+        title: str,
+        company: str,
+        location: str,
+        country: str,
+        keyword: str,
+        skills: str,
+        salary: str,
+        date: datetime.date,
+    ):
         h = job_hash(title, company, location, date)
         self.cur.execute(
             """
-            INSERT INTO glassdoor (
+            INSERT INTO public.glassdoor (
                 job_id, job_url, job_hash,
                 title, company, location,
                 location_sub, title_sub,
@@ -201,20 +330,22 @@ class DB:
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (job_hash) DO NOTHING
             """,
-            (job_id, job_url, h, title, company, location, location_sub, title_sub, skills, salary, date),
+            (job_id, job_url, h, title, company, location, country, keyword, skills, salary, date),
         )
         self.conn.commit()
         if self.cur.rowcount == 0:
             print(f"⚠️ Duplicate skipped: {title} @ {company}")
         else:
-            print(f"✅ Saved: {title} @ {company} | salary={salary}")
+            print(f"✅ Saved: {title} @ {company} | country={country} | kw={keyword} | salary={salary}")
 
 
-# =========================
-# DRIVER / HELPERS
-# =========================
+# =========================================================
+# SELENIUM
+# =========================================================
 def create_driver():
     options = uc.ChromeOptions()
+    if os.getenv("HEADLESS", "false").strip().lower() in ("1", "true", "yes", "y", "on"):
+        options.add_argument("--headless=new")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--start-maximized")
     options.add_argument("--no-sandbox")
@@ -224,20 +355,14 @@ def create_driver():
     options.page_load_strategy = "eager"
     return uc.Chrome(options=options)
 
-def load_cookies_if_any(driver):
-    driver.get(BASE_URL)
-    time.sleep(1.0)
-    if COOKIES_PATH.exists():
-        with open(COOKIES_PATH, "r", encoding="utf-8") as f:
-            cookies = json.load(f)
-        for c in cookies:
-            c.pop("sameSite", None)
-            try:
-                driver.add_cookie(c)
-            except Exception:
-                pass
-        driver.refresh()
-        time.sleep(1.0)
+
+def safe_quit(driver):
+    try:
+        if driver:
+            driver.quit()
+    except Exception:
+        pass
+
 
 def clear_and_type(el, text):
     el.click()
@@ -245,149 +370,158 @@ def clear_and_type(el, text):
     el.send_keys(Keys.DELETE)
     el.send_keys(text)
 
+
 def safe_text(driver, by, sel) -> str:
     try:
         return (driver.find_element(by, sel).text or "").strip()
     except Exception:
         return ""
 
+
 def close_popups(driver):
-    """
-    Glassdoor popups are frequent. We try to close most common ones.
-    Safe to call often.
-    """
     xpaths = [
         "//button[@aria-label='Close']",
         "//button[contains(@class,'CloseButton')]",
-        "//span[text()='Close']/ancestor::button[1]",
-        "//button//*[name()='svg' and @data-test='icon-close']/ancestor::button[1]",
+        "//button[contains(@data-test,'close')]",
         "//div[contains(@class,'Modal') or contains(@class,'modal')]//button[contains(.,'Close')]",
-        "//button[contains(.,'Continue')]",  # sometimes blocks content
-        "//button[contains(.,'Not now')]",
     ]
     for xp in xpaths:
         try:
             els = driver.find_elements(By.XPATH, xp)
-            if els:
+            for b in els[:2]:
                 try:
-                    els[0].click()
-                    time.sleep(0.2)
+                    b.click()
+                    time.sleep(0.12)
                 except Exception:
                     pass
         except Exception:
             pass
 
+
+def load_cookies_if_any(driver):
+    driver.get(BASE_URL)
+    time.sleep(0.8)
+    if COOKIES_PATH.exists():
+        try:
+            cookies = json.loads(COOKIES_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            cookies = []
+        for c in cookies:
+            if isinstance(c, dict):
+                c.pop("sameSite", None)
+                try:
+                    driver.add_cookie(c)
+                except Exception:
+                    pass
+        driver.refresh()
+        time.sleep(0.9)
+
+
+# =========================================================
+# DATE PARSER
+# =========================================================
 def parse_posted_date_from_text(t: str) -> datetime.date:
     today = datetime.date.today()
     s = (t or "").lower().strip()
-
-    # "30d+"
-    m = re.search(r"(\d+)\s*d\+", s)
+    m = re.search(r"(\d+)\s*d\+?", s)  # "3d" or "30d+"
     if m:
         return today - datetime.timedelta(days=int(m.group(1)))
-
-    # "7d"
-    m = re.search(r"(\d+)\s*d\b", s)
-    if m:
-        return today - datetime.timedelta(days=int(m.group(1)))
-
-    # hours -> today
-    if re.search(r"\b\d+\s*h\b", s) or "hour" in s:
+    if re.search(r"\b(\d+)\s*h\b", s) or "hour" in s:
         return today
-
     return today
 
-def get_job_id_from_url(url: str) -> str:
-    try:
-        qs = parse_qs(urlparse(url).query)
-        v = (qs.get("jobListingId") or [""])[0]
-        return v.strip()
-    except Exception:
-        return ""
 
-def wait_job_detail_loaded(driver, wait: WebDriverWait, job_id: str, timeout_sec: int = 12) -> bool:
-    """
-    Prevents stale panel issue: wait until page source contains this job_id.
-    """
-    if not job_id:
-        return True
-
-    end = time.time() + timeout_sec
-    while time.time() < end:
-        close_popups(driver)
-        try:
-            html = driver.page_source or ""
-            if job_id in html:
-                return True
-        except Exception:
-            pass
-        time.sleep(0.25)
-    return False
-
+# =========================================================
+# SALARY EXTRACTION (DETAIL PAGE ONLY)
+# =========================================================
 def extract_salary_raw(driver) -> str:
-    """
-    Robust salary extraction:
-    1) try multiple DOM selectors
-    2) if still empty -> regex from page_source
-    """
     close_popups(driver)
 
-    selectors = [
-        (By.XPATH, "//*[@data-test='detailSalary' or @data-test='salary' or @data-test='salaryEstimate']"),
-        (By.XPATH, "//*[contains(@id,'job-salary')]"),
-        (By.XPATH, "//*[contains(translate(., 'SALARY', 'salary'),'salary estimate')]"),
-        (By.XPATH, "//*[contains(.,'/year') or contains(.,'per year') or contains(.,'/hr') or contains(.,'per hour') or contains(.,'/mo') or contains(.,'per month')]"),
+    xpaths = [
+        # most common
+        "//*[@data-test='detailSalary']",
+        "//*[@data-test='salaryEstimate']",
+        "//*[@data-test='salary']",
+        "//*[contains(@id,'job-salary')]",
+        # class fallback
+        "//*[contains(@class,'salaryEstimate') or contains(@class,'SalaryEstimate')]",
+        # more generic but limit length
+        "//*[contains(@data-test,'salary') and string-length(normalize-space(.)) < 260]",
     ]
 
     candidates = []
-    for by, sel in selectors:
+    for xp in xpaths:
         try:
-            els = driver.find_elements(by, sel)
-            for el in els[:4]:
+            els = driver.find_elements(By.XPATH, xp)
+            for el in els[:12]:
                 txt = (el.text or "").strip()
-                if txt and len(txt) <= 200:
+                if not txt:
+                    continue
+                # must contain currency
+                if re.search(r"[\$€£₽₸]", txt) or re.search(r"(?i)\b(usd|eur|gbp|rub|kzt|uah|cad|aud|chf)\b", txt):
                     candidates.append(txt)
         except Exception:
             continue
 
-    # pick best candidate with money pattern
-    money_re = re.compile(r"[\$€£₽₸]\s*\d", re.I)
-    range_re = re.compile(r"[\$€£₽₸]?\s*\d[\d,\. ]*\s*[kK]?\s*[-–—]\s*[\$€£₽₸]?\s*\d", re.I)
-    for c in candidates:
-        if range_re.search(c) or money_re.search(c):
-            return c
+    if not candidates:
+        return ""
 
-    # regex from source as fallback (very important for partner pages)
-    try:
-        html = driver.page_source or ""
-        # examples: "$76,000 — $84,000/year" or "$127K - $194K"
-        m = re.search(r"([\$€£₽₸]\s*\d[\d, ]*(?:\.\d+)?\s*[kK]?\s*[-–—]\s*[\$€£₽₸]\s*\d[\d, ]*(?:\.\d+)?\s*[kK]?(?:\s*/\s*(?:year|month|hour))?)", html, re.I)
-        if m:
-            return m.group(1)
-        m2 = re.search(r"([\$€£₽₸]\s*\d[\d, ]*(?:\.\d+)?\s*[kK]?(?:\s*/\s*(?:year|month|hour))?)", html, re.I)
-        if m2:
-            return m2.group(1)
-    except Exception:
-        pass
+    def score(x: str) -> int:
+        s = 0
+        if re.search(r"\d", x): s += 2
+        if "-" in x: s += 2
+        if "/hr" in x.lower() or "hour" in x.lower(): s += 1
+        if "/yr" in x.lower() or "year" in x.lower(): s += 1
+        # prefer not too long
+        s += max(0, 220 - len(x)) // 8
+        return s
 
-    # last fallback: first candidate if any
-    return candidates[0] if candidates else ""
+    candidates.sort(key=score, reverse=True)
+    return candidates[0]
 
 
-# =========================
+# =========================================================
+# JSON LOADER
+# =========================================================
+def load_list_json(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        for k in ("jobs", "keywords", "list", "countries"):
+            if k in data and isinstance(data[k], list):
+                data = data[k]
+                break
+    if not isinstance(data, list):
+        return []
+    out = []
+    seen = set()
+    for x in data:
+        s = str(x).strip()
+        if not s:
+            continue
+        k = s.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(s)
+    return out
+
+
+# =========================================================
 # SCRAPER
-# =========================
+# =========================================================
 class GlassdoorScraper:
-    def __init__(self, job: str, country: str, driver, db: DB):
-        self.job = job
+    def __init__(self, keyword: str, country: str, driver, db: DB):
+        self.keyword = keyword
         self.country = country
         self.driver = driver
         self.db = db
-        self.wait = WebDriverWait(driver, 20)
+        self.wait = WebDriverWait(driver, DEFAULT_WAIT)
 
     def open_search(self):
-        self.driver.get("https://www.glassdoor.com/Job")
-        time.sleep(1.0)
+        self.driver.get(SEARCH_URL)
+        time.sleep(0.9)
         close_popups(self.driver)
 
         job_input = self.wait.until(
@@ -397,7 +531,7 @@ class GlassdoorScraper:
             EC.visibility_of_element_located((By.XPATH, "//input[contains(@aria-labelledby,'location')]"))
         )
 
-        clear_and_type(job_input, f'"{self.job}"')
+        clear_and_type(job_input, f"\"{self.keyword}\"")
         clear_and_type(loc_input, self.country)
         loc_input.send_keys(Keys.ENTER)
         time.sleep(1.2)
@@ -408,38 +542,21 @@ class GlassdoorScraper:
             self.driver.get(cur + "&sortBy=date_desc")
         else:
             self.driver.get(cur.replace("sortBy=relevance", "sortBy=date_desc"))
-        time.sleep(1.2)
-        close_popups(self.driver)
+        time.sleep(1.1)
 
-    def collect_cards_links(self, max_scroll=90) -> list[dict]:
+    def collect_cards_links(self) -> list[dict]:
         results = []
         seen = set()
         no_new = 0
         last_len = 0
 
-        for _ in range(max_scroll):
+        for _ in range(MAX_SCROLL):
             close_popups(self.driver)
-
             cards = self.driver.find_elements(By.XPATH, "//ul[@aria-label='Jobs List']/li")
+
             for li in cards:
                 try:
-                    # strongest selectors for job link
-                    a = None
-                    for xp in [
-                        ".//a[@data-test='job-link']",
-                        ".//a[contains(@href,'/partner/jobListing') or contains(@href,'/Job/')]",
-                        ".//a[contains(@href,'jobListingId=')]",
-                    ]:
-                        try:
-                            a = li.find_element(By.XPATH, xp)
-                            if a:
-                                break
-                        except Exception:
-                            continue
-
-                    if not a:
-                        continue
-
+                    a = li.find_element(By.XPATH, ".//a[contains(@href,'/partner/jobListing') or contains(@href,'/Job/')]")
                     href = a.get_attribute("href") or ""
                     if not href:
                         continue
@@ -460,16 +577,15 @@ class GlassdoorScraper:
                     except Exception:
                         pass
 
-                    job_id = get_job_id_from_url(url)
+                    m = re.search(r"jobListingId=(\d+)", url)
+                    job_id = m.group(1) if m else ""
 
                     results.append({"job_url": url, "job_id": job_id, "posted": posted, "location": loc})
-
                 except Exception:
                     continue
 
-            # scroll
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1.2)
+            time.sleep(SCROLL_PAUSE)
 
             if len(results) == last_len:
                 no_new += 1
@@ -477,88 +593,70 @@ class GlassdoorScraper:
                 no_new = 0
                 last_len = len(results)
 
-            if no_new >= 4:
+            if no_new >= NO_NEW_LIMIT:
                 break
 
         return results
 
-    def parse_job_detail_page(self, url: str, job_id: str, fallback_location: str, posted_txt: str) -> dict:
-        last_err = None
-        for attempt in range(1, 3):
-            try:
-                self.driver.get(url)
-                time.sleep(0.6)
-                close_popups(self.driver)
+    def parse_job_detail_page(self, url: str, fallback_location: str, posted_txt: str) -> dict:
+        self.driver.get(url)
+        close_popups(self.driver)
 
-                # wait title
-                self.wait.until(
-                    EC.presence_of_element_located((By.XPATH, "//h1[contains(@id,'job-title') or @data-test='jobTitle']"))
-                )
+        self.wait.until(
+            EC.presence_of_element_located((By.XPATH, "//h1[contains(@id,'job-title') or @data-test='jobTitle']"))
+        )
+        time.sleep(DETAIL_SLEEP)
+        close_popups(self.driver)
 
-                # crucial: wait correct vacancy is loaded (prevents salary carryover)
-                ok = wait_job_detail_loaded(self.driver, self.wait, job_id, timeout_sec=12)
-                if not ok and job_id:
-                    # try refresh once
-                    self.driver.refresh()
-                    time.sleep(1.0)
-                    close_popups(self.driver)
-                    wait_job_detail_loaded(self.driver, self.wait, job_id, timeout_sec=10)
+        title = safe_text(self.driver, By.XPATH, "//h1[contains(@id,'job-title') or @data-test='jobTitle']")
+        company = safe_text(self.driver, By.XPATH, "//div[contains(@class,'EmployerProfile_employerNameHeading')]")
 
-                title = safe_text(self.driver, By.XPATH, "//h1[contains(@id,'job-title') or @data-test='jobTitle']")
-                company = safe_text(self.driver, By.XPATH, "//div[contains(@class,'EmployerProfile_employerNameHeading')]")
+        location = safe_text(self.driver, By.XPATH, "//*[contains(@data-test,'location')][1]")
+        if not location:
+            location = fallback_location or ""
 
-                # location from detail or fallback
-                location = safe_text(self.driver, By.XPATH, "//*[contains(@data-test,'location')][1]")
-                if not location:
-                    location = fallback_location or ""
+        raw_salary = extract_salary_raw(self.driver)
+        salary = normalize_glassdoor_salary(raw_salary)
 
-                # salary robust
-                raw_salary = extract_salary_raw(self.driver)
-                salary = normalize_glassdoor_salary(raw_salary)
+        skills = ""
+        try:
+            skills_elems = self.driver.find_elements(By.XPATH, "//li[contains(@class,'PendingQualification_pendingQualification')]")
+            skills = ",".join(x.text.strip() for x in skills_elems if (x.text or "").strip())
+        except Exception:
+            skills = ""
 
-                # skills
-                skills = ""
-                try:
-                    skills_elems = self.driver.find_elements(
-                        By.XPATH, "//li[contains(@class,'PendingQualification_pendingQualification')]"
-                    )
-                    skills = ",".join(x.text.strip() for x in skills_elems if (x.text or "").strip())
-                except Exception:
-                    skills = ""
+        date = parse_posted_date_from_text(posted_txt)
 
-                date = parse_posted_date_from_text(posted_txt)
+        job_id = ""
+        m = re.search(r"jobListingId=(\d+)", url)
+        if m:
+            job_id = m.group(1)
 
-                return {
-                    "job_id": job_id or get_job_id_from_url(url),
-                    "job_url": url,
-                    "title": title,
-                    "company": company,
-                    "location": location,
-                    "skills": skills,
-                    "salary": salary,
-                    "date": date,
-                }
+        # ✅ translate (no api)
+        title = ensure_english(title)
+        company = ensure_english(company)
+        location = ensure_english(location)
 
-            except Exception as e:
-                last_err = e
-                try:
-                    self.driver.refresh()
-                except Exception:
-                    pass
-                time.sleep(1.0)
-
-        raise last_err
+        return {
+            "job_id": job_id,
+            "job_url": url,
+            "title": title,
+            "company": company,
+            "location": location,
+            "skills": skills,
+            "salary": salary,
+            "date": date,
+        }
 
     def run(self):
         self.open_search()
-        links = self.collect_cards_links(max_scroll=90)
-        print(f"[COLLECT] job={self.job} collected_links={len(links)}")
+        links = self.collect_cards_links()
+        print(f"[COLLECT] keyword={self.keyword} country={self.country} collected_links={len(links)}")
 
         for item in links:
             try:
                 detail = self.parse_job_detail_page(
-                    url=item["job_url"],
-                    job_id=item.get("job_id", ""),
+                    item["job_url"],
                     fallback_location=item.get("location", ""),
                     posted_txt=item.get("posted", ""),
                 )
@@ -569,32 +667,32 @@ class GlassdoorScraper:
                     title=detail["title"],
                     company=detail["company"],
                     location=detail["location"],
-                    location_sub=self.country,
-                    title_sub=self.job,
+                    country=self.country,
+                    keyword=self.keyword,
                     skills=detail["skills"],
                     salary=detail["salary"],
                     date=detail["date"],
                 )
-
-                time.sleep(0.4)
-
+                time.sleep(BETWEEN_DETAIL_SLEEP)
             except Exception as e:
                 print(f"[DETAIL FAIL] {item.get('job_url')} err={e}")
-                time.sleep(0.8)
+                time.sleep(0.6)
 
 
-# =========================
+# =========================================================
 # MAIN
-# =========================
-if __name__ == "__main__":
-    with open(JOBS_PATH, "r", encoding="utf-8") as f:
-        jobs = json.load(f)
-    if isinstance(jobs, dict):
-        for k in ("jobs", "keywords", "list"):
-            if k in jobs and isinstance(jobs[k], list):
-                jobs = jobs[k]
-                break
-    jobs = [str(x).strip() for x in jobs if str(x).strip()]
+# =========================================================
+def main():
+    jobs = load_list_json(JOBS_PATH)
+    countries = load_list_json(COUNTRIES_PATH)
+
+    print(f"[JOBS] {len(jobs)} -> {jobs[:10]}")
+    print(f"[COUNTRIES] {len(countries)} -> {countries[:10]}")
+
+    if not jobs:
+        raise RuntimeError(f"job_list not found or empty: {JOBS_PATH}")
+    if not countries:
+        raise RuntimeError(f"countries not found or empty: {COUNTRIES_PATH}")
 
     driver = create_driver()
     db = DB()
@@ -603,15 +701,17 @@ if __name__ == "__main__":
     try:
         load_cookies_if_any(driver)
 
-        for job in jobs:
-            try:
-                GlassdoorScraper(job, "United States", driver=driver, db=db).run()
-            except Exception as e:
-                print(f"[JOB FAIL] {job} err={e}")
+        for kw in jobs:
+            for country in countries:
+                try:
+                    GlassdoorScraper(kw, country, driver=driver, db=db).run()
+                except Exception as e:
+                    print(f"[SEARCH FAIL] kw={kw} country={country} err={e}")
 
     finally:
         db.close()
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        safe_quit(driver)
+
+
+if __name__ == "__main__":
+    main()
