@@ -24,8 +24,8 @@ JOBS_PATH = Path(os.getenv("JOBS_PATH", str(BASE_DIR / "job_list.json")))
 REMOTEOK_URL = "https://remoteok.com/"
 SOURCE_NAME = "remoteok"
 
-MAX_SCROLLS = 80
-SCROLL_PAUSE = 1.2
+MAX_SCROLLS_PER_KEYWORD = 60   # har keyword uchun scroll limiti
+SCROLL_PAUSE = 1.1
 NO_NEW_LIMIT = 6
 HEADLESS = False
 
@@ -33,16 +33,16 @@ HEADLESS = False
 # ================== SALARY NORMALIZER (REMOTEOK: $40k - $120k) ==================
 def normalize_salary_k_range(raw: Optional[str]) -> Optional[str]:
     """
-    RemoteOK salary examples:
+    Examples:
       "💰 $40k - $120k" -> "40 000 - 120 000 $"
       "$70k - $90k"     -> "70 000 - 90 000 $"
       "$120k"           -> "120 000 $"
       "€80k–€140k"      -> "80 000 - 140 000 €"
       "" / None         -> None
 
-    Rules:
-      - k => * 1000
-      - keep currency at end if found ($, €, £, etc. OR currency code)
+    Notes:
+      - k => *1000
+      - currency is moved to the end
       - output: "min - max CUR" or "min CUR"
     """
     if not raw:
@@ -52,11 +52,11 @@ def normalize_salary_k_range(raw: Optional[str]) -> Optional[str]:
     if not s:
         return None
 
-    # remove emoji + extra words (keep only salary-ish text)
+    # remove emoji + weird spaces
     s = re.sub(r"[💰\n\r\t]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
 
-    # detect currency: symbols first, then codes
+    # detect currency
     cur = ""
     sym_m = re.search(r"[\$€£₽₸]", s)
     if sym_m:
@@ -70,7 +70,6 @@ def normalize_salary_k_range(raw: Optional[str]) -> Optional[str]:
     s2 = s.replace("–", "-").replace("—", "-")
 
     # find numbers with optional k/K
-    # examples matched: 40k, 120k, 500k, 10k
     nums = re.findall(r"(\d+(?:[.,]\d+)?)\s*([kK])?", s2)
     if not nums:
         return None
@@ -80,13 +79,11 @@ def normalize_salary_k_range(raw: Optional[str]) -> Optional[str]:
         val = float(num_str)
         if has_k:
             val *= 1000.0
-        # int formatting with spaces: 40000 -> "40 000"
         iv = int(round(val))
         return f"{iv:,}".replace(",", " ")
 
     values = [to_int_str(n, bool(k)) for n, k in nums]
 
-    # decide output
     if len(values) >= 2:
         out = f"{values[0]} - {values[1]}"
     else:
@@ -116,12 +113,6 @@ def open_db():
 
 
 def ensure_table_exists(conn):
-    """
-    ✅ New columns:
-    - posted_at (real time from '7h/2d/1mo')
-    - posted_date
-    - job_subtitle (matched keyword)
-    """
     sql = """
     CREATE TABLE IF NOT EXISTS public.remoteok (
         job_id TEXT NOT NULL,
@@ -147,15 +138,13 @@ def ensure_table_exists(conn):
         cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS posted_at TIMESTAMP NULL;")
         cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS posted_date DATE NULL;")
         cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS job_subtitle TEXT NULL;")
+        cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS page INT;")
     conn.commit()
 
 
-def insert_rows(conn, rows: List[Tuple]) -> Tuple[int, int]:
-    """
-    returns: (inserted_or_updated, skipped_estimate)
-    """
+def insert_rows(conn, rows: List[Tuple]) -> int:
     if not rows:
-        return 0, 0
+        return 0
 
     sql = """
     INSERT INTO public.remoteok (
@@ -178,24 +167,33 @@ def insert_rows(conn, rows: List[Tuple]) -> Tuple[int, int]:
         posted_date  = COALESCE(EXCLUDED.posted_date, public.remoteok.posted_date),
         job_subtitle = COALESCE(EXCLUDED.job_subtitle, public.remoteok.job_subtitle);
     """
-
     with conn.cursor() as cur:
-        execute_values(cur, sql, rows, page_size=300)
+        execute_values(cur, sql, rows, page_size=250)
     conn.commit()
-
-    return len(rows), 0
+    return len(rows)
 
 
 # ================== KEYWORDS ==================
 def load_keywords() -> List[str]:
     if not JOBS_PATH.exists():
-        return []
+        raise RuntimeError(f"job_list.json topilmadi: {JOBS_PATH}")
+
     data = json.loads(JOBS_PATH.read_text(encoding="utf-8"))
+
+    # accept list or dict wrapper
+    if isinstance(data, dict):
+        for k in ("jobs", "keywords", "list"):
+            if k in data and isinstance(data[k], list):
+                data = data[k]
+                break
+
     kws = []
     for x in data:
         s = str(x).strip()
         if s:
             kws.append(s)
+
+    # unique preserve order
     seen = set()
     out = []
     for k in kws:
@@ -206,26 +204,12 @@ def load_keywords() -> List[str]:
     return out
 
 
-def normalize(s: Optional[str]) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
-
-
-def find_matching_keyword(
-    title: Optional[str],
-    company: Optional[str],
-    location: Optional[str],
-    skills: Optional[str],
-    keywords: List[str],
-) -> Optional[str]:
-    hay = normalize(" ".join([(title or ""), (company or ""), (location or ""), (skills or "")]))
-    if not hay or not keywords:
-        return None
-
-    for kw in keywords:
-        tokens = normalize(kw).split()
-        if any(t in hay for t in tokens if len(t) >= 2):
-            return kw
-    return None
+def keyword_to_remoteok_url(keyword: str) -> str:
+    """
+    "Data Analyst" -> https://remoteok.com/remote-data-analyst-jobs
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", keyword.strip().lower()).strip("-")
+    return f"https://remoteok.com/remote-{slug}-jobs"
 
 
 # ================== SELENIUM ==================
@@ -233,8 +217,13 @@ def create_driver():
     opts = webdriver.ChromeOptions()
     if HEADLESS:
         opts.add_argument("--headless=new")
-    opts.add_argument("--start-maximized")
+        opts.add_argument("--window-size=1920,1080")
+    else:
+        opts.add_argument("--start-maximized")
+
     opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
 
     return webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
@@ -242,8 +231,8 @@ def create_driver():
     )
 
 
-def wait_ready(driver):
-    WebDriverWait(driver, 30).until(lambda d: d.execute_script("return document.readyState") == "complete")
+def wait_ready(driver, timeout=30):
+    WebDriverWait(driver, timeout).until(lambda d: d.execute_script("return document.readyState") == "complete")
 
 
 def safe_text(el) -> str:
@@ -253,7 +242,7 @@ def safe_text(el) -> str:
         return ""
 
 
-# ================== POSTED TIME PARSER (7h / 2d / 1mo ...)
+# ================== POSTED TIME PARSER (7h / 2d / 1mo ...) ==================
 def parse_relative_age(age_text: str) -> Optional[datetime.datetime]:
     if not age_text:
         return None
@@ -312,10 +301,10 @@ def extract_posted_at_from_tr(tr) -> Optional[datetime.datetime]:
     return None
 
 
-def extract_rows(driver, page: int) -> List[Tuple]:
+# ================== ROW EXTRACTION ==================
+def extract_rows(driver, page: int, job_subtitle: str) -> List[Tuple]:
     """
-    Tuple layout:
-      job_id, source, title, company, loc, sal, job_type, skills, education, link, page, posted_at, posted_date
+    Rows: (job_id, source, title, company, loc, sal, job_type, skills, edu, link, page, posted_at, posted_date, job_subtitle)
     """
     rows = []
     trs = driver.find_elements(By.CSS_SELECTOR, "tr.job")
@@ -326,8 +315,18 @@ def extract_rows(driver, page: int) -> List[Tuple]:
                 continue
 
             job_id = f"remoteok_{rid}"
-            title = safe_text(tr.find_element(By.CSS_SELECTOR, "h2")) or None
-            company = safe_text(tr.find_element(By.CSS_SELECTOR, "h3")) or None
+
+            title = None
+            company = None
+
+            try:
+                title = safe_text(tr.find_element(By.CSS_SELECTOR, "h2")) or None
+            except Exception:
+                pass
+            try:
+                company = safe_text(tr.find_element(By.CSS_SELECTOR, "h3")) or None
+            except Exception:
+                pass
 
             loc = None
             loc_els = tr.find_elements(By.CSS_SELECTOR, ".location")
@@ -339,7 +338,6 @@ def extract_rows(driver, page: int) -> List[Tuple]:
             if sal_els:
                 sal = safe_text(sal_els[0]) or None
 
-            # ✅ normalize RemoteOK salary: $40k - $120k -> 40 000 - 120 000 $
             sal = normalize_salary_k_range(sal)
 
             tags = tr.find_elements(By.CSS_SELECTOR, ".tags a, .tags span")
@@ -380,22 +378,24 @@ def extract_rows(driver, page: int) -> List[Tuple]:
                     page,
                     posted_at,
                     posted_date,
+                    job_subtitle,  # ✅ keyword
                 )
             )
         except Exception:
             continue
+
     return rows
 
 
-# ================== MAIN LOOP (insert while scrolling) ==================
-def scroll_collect_and_insert(driver, conn, keywords: List[str]) -> None:
+# ================== SCROLL & INSERT PER KEYWORD ==================
+def collect_for_keyword(driver, conn, keyword: str) -> None:
     seen: Set[str] = set()
     no_new = 0
     total_unique = 0
-    total_processed = 0
+    total_upserted = 0
 
-    for page in range(1, MAX_SCROLLS + 1):
-        base_rows = extract_rows(driver, page)
+    for page in range(1, MAX_SCROLLS_PER_KEYWORD + 1):
+        base_rows = extract_rows(driver, page, job_subtitle=keyword)
 
         fresh = []
         for r in base_rows:
@@ -405,42 +405,26 @@ def scroll_collect_and_insert(driver, conn, keywords: List[str]) -> None:
 
         new_count = len(fresh)
         total_unique += new_count
-        print(f"[SCROLL] page={page} total_unique={total_unique} new={new_count}")
+        print(f"[SCROLL] kw='{keyword}' page={page} total_unique={total_unique} new={new_count}")
 
         if new_count == 0:
             no_new += 1
         else:
             no_new = 0
 
-        filtered_with_subtitle = []
-        for r in fresh:
-            job_id, source, title, company, loc, sal, job_type, skills, edu, link, pg, posted_at, posted_date = r
-            matched_kw = find_matching_keyword(title, company, loc, skills, keywords)
-            if not matched_kw:
-                continue
-
-            filtered_with_subtitle.append(
-                (
-                    job_id, source, title, company, loc, sal, job_type, skills, edu, link, pg,
-                    posted_at, posted_date, matched_kw
-                )
-            )
-
-        if filtered_with_subtitle:
-            processed, _ = insert_rows(conn, filtered_with_subtitle)
-            total_processed += processed
-            print(f"[DB] page={page} matched={len(filtered_with_subtitle)} upserted={processed}")
-        else:
-            print(f"[FILTER] page={page} matched=0")
+        if fresh:
+            up = insert_rows(conn, fresh)
+            total_upserted += up
+            print(f"[DB] kw='{keyword}' upserted={up} total_upserted={total_upserted}")
 
         if no_new >= NO_NEW_LIMIT:
-            print(f"[STOP] no_new_limit reached ({NO_NEW_LIMIT})")
+            print(f"[STOP] kw='{keyword}' no_new_limit reached ({NO_NEW_LIMIT})")
             break
 
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(SCROLL_PAUSE)
 
-    print(f"[DONE] total_unique={total_unique} total_upserted={total_processed}")
+    print(f"[DONE] kw='{keyword}' total_unique={total_unique} total_upserted={total_upserted}")
 
 
 def main():
@@ -451,12 +435,20 @@ def main():
     driver = None
     try:
         ensure_table_exists(conn)
-
         driver = create_driver()
+
+        # optional warmup
         driver.get(REMOTEOK_URL)
         wait_ready(driver)
 
-        scroll_collect_and_insert(driver, conn, keywords)
+        for kw in keywords:
+            url = keyword_to_remoteok_url(kw)
+            print(f"\n[SEARCH] keyword='{kw}' -> {url}")
+
+            driver.get(url)
+            wait_ready(driver)
+
+            collect_for_keyword(driver, conn, kw)
 
     finally:
         try:
