@@ -30,6 +30,73 @@ NO_NEW_LIMIT = 6
 HEADLESS = False
 
 
+# ================== SALARY NORMALIZER (REMOTEOK: $40k - $120k) ==================
+def normalize_salary_k_range(raw: Optional[str]) -> Optional[str]:
+    """
+    RemoteOK salary examples:
+      "💰 $40k - $120k" -> "40 000 - 120 000 $"
+      "$70k - $90k"     -> "70 000 - 90 000 $"
+      "$120k"           -> "120 000 $"
+      "€80k–€140k"      -> "80 000 - 140 000 €"
+      "" / None         -> None
+
+    Rules:
+      - k => * 1000
+      - keep currency at end if found ($, €, £, etc. OR currency code)
+      - output: "min - max CUR" or "min CUR"
+    """
+    if not raw:
+        return None
+
+    s = raw.strip()
+    if not s:
+        return None
+
+    # remove emoji + extra words (keep only salary-ish text)
+    s = re.sub(r"[💰\n\r\t]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # detect currency: symbols first, then codes
+    cur = ""
+    sym_m = re.search(r"[\$€£₽₸]", s)
+    if sym_m:
+        cur = sym_m.group(0)
+    else:
+        code_m = re.search(r"(?i)\b(usd|eur|gbp|kzt|rub|uah|byn|cad|aud|chf|sek|nok|dkk)\b", s)
+        if code_m:
+            cur = code_m.group(1).upper()
+
+    # unify dash variants
+    s2 = s.replace("–", "-").replace("—", "-")
+
+    # find numbers with optional k/K
+    # examples matched: 40k, 120k, 500k, 10k
+    nums = re.findall(r"(\d+(?:[.,]\d+)?)\s*([kK])?", s2)
+    if not nums:
+        return None
+
+    def to_int_str(num_str: str, has_k: bool) -> str:
+        num_str = num_str.replace(",", ".")
+        val = float(num_str)
+        if has_k:
+            val *= 1000.0
+        # int formatting with spaces: 40000 -> "40 000"
+        iv = int(round(val))
+        return f"{iv:,}".replace(",", " ")
+
+    values = [to_int_str(n, bool(k)) for n, k in nums]
+
+    # decide output
+    if len(values) >= 2:
+        out = f"{values[0]} - {values[1]}"
+    else:
+        out = f"{values[0]}"
+
+    if cur:
+        return f"{out} {cur}".strip()
+    return out
+
+
 # ================== DB ==================
 def env_required(key: str) -> str:
     v = os.getenv(key)
@@ -78,7 +145,6 @@ def ensure_table_exists(conn):
     """
     with conn.cursor() as cur:
         cur.execute(sql)
-        # safety for existing tables
         cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS posted_at TIMESTAMP NULL;")
         cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS posted_date DATE NULL;")
         cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS job_subtitle TEXT NULL;")
@@ -118,8 +184,6 @@ def insert_rows(conn, rows: List[Tuple]) -> Tuple[int, int]:
         execute_values(cur, sql, rows, page_size=300)
     conn.commit()
 
-    # estimate: we can't easily know exact updated vs inserted without RETURNING,
-    # so we return len(rows) as processed and 0 skipped.
     return len(rows), 0
 
 
@@ -128,13 +192,11 @@ def load_keywords() -> List[str]:
     if not JOBS_PATH.exists():
         return []
     data = json.loads(JOBS_PATH.read_text(encoding="utf-8"))
-    # keep original + lower version for matching
     kws = []
     for x in data:
         s = str(x).strip()
         if s:
             kws.append(s)
-    # unique preserve order
     seen = set()
     out = []
     for k in kws:
@@ -156,9 +218,6 @@ def find_matching_keyword(
     skills: Optional[str],
     keywords: List[str],
 ) -> Optional[str]:
-    """
-    ✅ returns the FIRST keyword that matches (job_subtitle)
-    """
     hay = normalize(" ".join([(title or ""), (company or ""), (location or ""), (skills or "")]))
     if not hay or not keywords:
         return None
@@ -166,7 +225,7 @@ def find_matching_keyword(
     for kw in keywords:
         tokens = normalize(kw).split()
         if any(t in hay for t in tokens if len(t) >= 2):
-            return kw  # original keyword text
+            return kw
     return None
 
 
@@ -185,9 +244,7 @@ def create_driver():
 
 
 def wait_ready(driver):
-    WebDriverWait(driver, 30).until(
-        lambda d: d.execute_script("return document.readyState") == "complete"
-    )
+    WebDriverWait(driver, 30).until(lambda d: d.execute_script("return document.readyState") == "complete")
 
 
 def safe_text(el) -> str:
@@ -199,19 +256,12 @@ def safe_text(el) -> str:
 
 # ================== POSTED TIME PARSER (7h / 2d / 1mo ...)
 def parse_relative_age(age_text: str) -> Optional[datetime.datetime]:
-    """
-    RemoteOK cards show: '7h', '2d', '1mo', '3y' (sometimes 'm' minutes)
-    We convert to posted_at = now - delta
-    """
     if not age_text:
         return None
 
-    t = age_text.strip().lower()
-    t = t.replace(" ", "")
-
+    t = age_text.strip().lower().replace(" ", "")
     now = datetime.datetime.now()
 
-    # Examples: 7h, 2d, 1mo, 3y, 45m
     m = re.match(r"^(\d+)(m|h|d|w|mo|y)$", t)
     if not m:
         return None
@@ -228,26 +278,15 @@ def parse_relative_age(age_text: str) -> Optional[datetime.datetime]:
     if unit == "w":
         return now - datetime.timedelta(weeks=n)
     if unit == "mo":
-        # approx month = 30 days
         return now - datetime.timedelta(days=30 * n)
     if unit == "y":
-        # approx year = 365 days
         return now - datetime.timedelta(days=365 * n)
 
     return None
 
 
 def extract_posted_at_from_tr(tr) -> Optional[datetime.datetime]:
-    """
-    Try to find card time text (e.g. '7h') from the row.
-    RemoteOK layout can vary, so we try multiple selectors.
-    """
-    # Most common: time text in a time cell
-    selectors = [
-        "td.time",           # often contains '7h'
-        ".time",             # fallback
-        "time",              # sometimes time tag
-    ]
+    selectors = ["td.time", ".time", "time"]
 
     for sel in selectors:
         try:
@@ -259,14 +298,11 @@ def extract_posted_at_from_tr(tr) -> Optional[datetime.datetime]:
         except Exception:
             continue
 
-    # try attribute-based (sometimes <time datetime="...">)
     try:
         t_el = tr.find_element(By.CSS_SELECTOR, "time[datetime]")
         dt_raw = t_el.get_attribute("datetime")
         if dt_raw:
-            # try ISO parsing
             try:
-                # keep simple: YYYY-MM-DDTHH:MM:SSZ
                 dt_raw = dt_raw.replace("Z", "+00:00")
                 return datetime.datetime.fromisoformat(dt_raw).replace(tzinfo=None)
             except Exception:
@@ -279,8 +315,7 @@ def extract_posted_at_from_tr(tr) -> Optional[datetime.datetime]:
 
 def extract_rows(driver, page: int) -> List[Tuple]:
     """
-    Base rows WITHOUT job_subtitle (it’s added after keyword match)
-    Tuple layout (base):
+    Tuple layout:
       job_id, source, title, company, loc, sal, job_type, skills, education, link, page, posted_at, posted_date
     """
     rows = []
@@ -304,6 +339,9 @@ def extract_rows(driver, page: int) -> List[Tuple]:
             sal_els = tr.find_elements(By.CSS_SELECTOR, ".salary")
             if sal_els:
                 sal = safe_text(sal_els[0]) or None
+
+            # ✅ normalize RemoteOK salary: $40k - $120k -> 40 000 - 120 000 $
+            sal = normalize_salary_k_range(sal)
 
             tags = tr.find_elements(By.CSS_SELECTOR, ".tags a, .tags span")
             skills_list = [safe_text(t) for t in tags]
@@ -360,7 +398,6 @@ def scroll_collect_and_insert(driver, conn, keywords: List[str]) -> None:
     for page in range(1, MAX_SCROLLS + 1):
         base_rows = extract_rows(driver, page)
 
-        # uniq
         fresh = []
         for r in base_rows:
             if r[0] not in seen:
@@ -376,7 +413,6 @@ def scroll_collect_and_insert(driver, conn, keywords: List[str]) -> None:
         else:
             no_new = 0
 
-        # filter + attach job_subtitle (matched keyword)
         filtered_with_subtitle = []
         for r in fresh:
             job_id, source, title, company, loc, sal, job_type, skills, edu, link, pg, posted_at, posted_date = r
