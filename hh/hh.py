@@ -21,10 +21,8 @@ load_dotenv()
 TABLE_NAME = "public.hh"
 DEFAULT_WAIT = 20
 
-
 # ----------------------------
 # FALLBACK ENGLISH NORMALIZER (NO API)
-# Goal: NO Cyrillic remains; use EN mappings where possible
 # ----------------------------
 _RU2LAT = {
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d",
@@ -37,7 +35,6 @@ _RU2LAT = {
 }
 
 _MAP_EXACT = {
-    # locations
     "ташкент": "Tashkent",
     "минск": "Minsk",
     "москва": "Moscow",
@@ -47,7 +44,6 @@ _MAP_EXACT = {
     "киев": "Kyiv",
     "санкт-петербург": "Saint Petersburg",
 
-    # job titles / common words
     "графический дизайнер": "Graphic Designer",
     "дизайнер": "Designer",
     "аниматор": "Animator",
@@ -55,7 +51,6 @@ _MAP_EXACT = {
     "моушн-дизайн": "Motion Design",
     "веб-дизайн": "Web Design",
 
-    # salary words
     "за месяц": "per month",
     "на руки": "net",
     "от": "from",
@@ -114,15 +109,6 @@ def _translit_ru_to_lat(text: str) -> str:
 
 
 def to_english(text: str) -> str:
-    """
-    NO API.
-    1) cache
-    2) exact mapping
-    3) replace known phrases in text
-    4) convert language-level patterns
-    5) translit remaining Cyrillic => Latin
-    Result: no Cyrillic letters remain.
-    """
     if not text:
         return ""
 
@@ -164,7 +150,6 @@ def to_english(text: str) -> str:
         res = _translit_ru_to_lat(res)
 
     res = re.sub(r"\s+", " ", res).strip()
-
     _TEXT_CACHE[s] = res
     return res
 
@@ -184,7 +169,7 @@ def normalize_skills_csv(skills_csv: str) -> str:
 
 def normalize_salary_range(s: str) -> str:
     """
-    Keeps currency at the end if present.
+    Output: only digits + spaces + dash, currency at end if present
 
     Examples:
       "ot 400 000 do 700 000 ₸ per month, net" -> "400 000 - 700 000 ₸"
@@ -201,9 +186,7 @@ def normalize_salary_range(s: str) -> str:
     if not raw:
         return ""
 
-    t = raw.lower()
-
-    t = t.replace("from", "ot").replace("up to", "do")
+    t = raw.lower().replace("from", "ot").replace("up to", "do")
 
     cur = ""
     cur_m = re.search(r"(?i)\b(usd|eur|gbp|kzt|rub|uah|byn|br|pln|try|aed|sar|cad|aud|chf|sek|nok|dkk)\b", raw)
@@ -218,8 +201,7 @@ def normalize_salary_range(s: str) -> str:
         m = re.search(rf"\b{keyword}\b\s*([\d\s]+)", t)
         if not m:
             return None
-        n = m.group(1)
-        n = re.sub(r"[^\d\s]", "", n)
+        n = re.sub(r"[^\d\s]", "", m.group(1))
         n = re.sub(r"\s+", " ", n).strip()
         return n or None
 
@@ -240,9 +222,7 @@ def normalize_salary_range(s: str) -> str:
             return ""
         out = f"{nums[0]} - {nums[1]}" if len(nums) >= 2 else nums[0]
 
-    if cur:
-        return f"{out} {cur}".strip()
-    return out
+    return f"{out} {cur}".strip() if cur else out
 
 
 # ----------------------------
@@ -260,10 +240,12 @@ cursor = conn.cursor()
 
 
 def create_table_if_not_exists():
+    # ✅ id is primary key; job_id stays UNIQUE for dedup
     cursor.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-            job_id TEXT PRIMARY KEY,
+            id BIGSERIAL PRIMARY KEY,
+            job_id TEXT NOT NULL UNIQUE,
             job_title TEXT,
             location TEXT,
             skills TEXT,
@@ -280,10 +262,32 @@ def create_table_if_not_exists():
         );
         """
     )
+
+    # safety for existing table (if you already had old schema)
+    cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS id BIGSERIAL;")
+    cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();")
+    cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS job_subtitle TEXT;")
     cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS search_query TEXT;")
+
+    cursor.execute(
+        f"""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_indexes
+                WHERE schemaname = split_part('{TABLE_NAME}', '.', 1)
+                  AND tablename  = split_part('{TABLE_NAME}', '.', 2)
+                  AND indexname  = 'hh_job_id_unique'
+            ) THEN
+                EXECUTE 'CREATE UNIQUE INDEX hh_job_id_unique ON {TABLE_NAME} (job_id)';
+            END IF;
+        END$$;
+        """
+    )
 
 
 def save_to_database(data: dict):
+    # ✅ conflict on job_id (unique) NOT on id
     cursor.execute(
         f"""
         INSERT INTO {TABLE_NAME} (
@@ -448,16 +452,11 @@ def get_hh_posted_date(driver) -> datetime.date:
 
 
 # ----------------------------
-# SEARCH PAGE URLS (FIX: 2nd job, 3rd job, ...)
+# SEARCH PAGE URLS (FIX: always goes 1st, 2nd, 3rd job...)
 # ----------------------------
 def get_search_result_urls(driver, wait) -> list[str]:
-    """
-    IMPORTANT FIX:
-    - Don't use //a[contains(@class,'magritte-link')] (too broad)
-    - Use only vacancy title links: a[data-qa='serp-item__title']
-    """
     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[data-qa='serp-item__title']")))
-    time.sleep(0.2)  # let JS finish rendering more items
+    time.sleep(0.2)
 
     links = driver.find_elements(By.CSS_SELECTOR, "a[data-qa='serp-item__title']")
     urls = []
@@ -503,11 +502,7 @@ def get_hh_vacancies(jobs_list):
                     break
 
                 for url in urls:
-                    if not isinstance(url, str) or "/vacancy/" not in url:
-                        continue
-
-                    # anti-bot: small delay between pages
-                    time.sleep(0.5)
+                    time.sleep(0.45)
                     driver.get(url)
 
                     job_id = url.split("?")[0].split("/")[-1]
