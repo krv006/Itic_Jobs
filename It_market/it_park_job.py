@@ -26,8 +26,13 @@ WORK_STYLES = ["Office Work", "Remote Work", "Partially Remote Work"]
 EMP_TYPES = ["Full Time", "Part Time", "To be discussed"]
 EXPERIENCES = ["No experience", "From 1 to 3 years", "From 3 to 5 years", "Over 5 years"]
 
+# ✅ Better salary detection across the whole page text
+# matches:
+#   "300 USD dan 1000 gacha"
+#   "7000000 UZS dan 15000000 gacha"
+#   "1 UZS dan 1 gacha"
 SALARY_RE = re.compile(
-    r"(?P<salary>\b\d[\d\s]*\s*(?:UZS|USD)\s*dan\s*(?:boshlab|\d[\d\s]*\s*gacha)\b)",
+    r"(?P<from>\d[\d\s]*)\s*(?P<cur>UZS|USD)\s*dan\s*(?P<to>\d[\d\s]*)\s*gacha",
     re.IGNORECASE
 )
 
@@ -72,6 +77,59 @@ cursor = conn.cursor()
 
 
 # ===========================
+# ✅ SALARY NORMALIZER (IT-MARKET)
+# ===========================
+def _fmt_num_spaces(n: str) -> str:
+    n = re.sub(r"[^\d]", "", n or "")
+    if not n:
+        return ""
+    return f"{int(n):,}".replace(",", " ")
+
+
+def normalize_itmarket_salary(raw: str) -> str:
+    """
+    Input examples:
+      "" -> ""
+      "300 USD dan 1000 gacha" -> "300 - 1 000 USD"
+      "7000000 UZS dan 15000000 gacha" -> "7 000 000 - 15 000 000 UZS"
+      "1 UZS dan 1 gacha" -> "1 - 1 UZS"
+
+    Rules:
+      - Extract from/to + currency
+      - Format numbers with spaces
+      - Output: "<from> - <to> CUR"
+    """
+    if not raw:
+        return ""
+
+    s = re.sub(r"\s+", " ", raw.strip())
+    if not s:
+        return ""
+
+    m = SALARY_RE.search(s)
+    if not m:
+        # fallback: sometimes spacing/extra symbols, try soft parse
+        m2 = re.search(r"(\d[\d\s]*)\s*(UZS|USD)\s*dan\s*(\d[\d\s]*)\s*gacha", s, re.IGNORECASE)
+        if not m2:
+            return s  # keep original if we really can't parse
+        frm = _fmt_num_spaces(m2.group(1))
+        cur = m2.group(2).upper()
+        to = _fmt_num_spaces(m2.group(3))
+        if frm and to and cur:
+            return f"{frm} - {to} {cur}".strip()
+        return s
+
+    frm = _fmt_num_spaces(m.group("from"))
+    to = _fmt_num_spaces(m.group("to"))
+    cur = (m.group("cur") or "").upper()
+
+    if not frm or not to or not cur:
+        return ""
+
+    return f"{frm} - {to} {cur}".strip()
+
+
+# ===========================
 # ✅ DB (ADD search_query)
 # ===========================
 def create_table_if_not_exists():
@@ -89,13 +147,8 @@ def create_table_if_not_exists():
             company_name TEXT,
             job_url TEXT,
             description TEXT,
-
-            -- meta subtitle (work_style|experience|employment_type)
             job_subtitle TEXT,
-
-            -- ✅ keyword from job_list.json (search query)
             search_query TEXT,
-
             posted_date DATE,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE (source, job_id)
@@ -129,8 +182,8 @@ def save_to_database(data: dict) -> bool:
         data["company_name"],
         data["job_url"],
         data["description"],
-        data["job_subtitle"],   # meta subtitle
-        data["search_query"],   # ✅ job_list keyword
+        data["job_subtitle"],
+        data["search_query"],
         data["posted_date"],
     ))
     return cursor.rowcount == 1
@@ -310,8 +363,12 @@ def parse_section_text(lines: list[str], section_name: str) -> str:
 def extract_meta(lines: list[str]) -> dict:
     text = " ".join(lines)
 
+    # ✅ Find raw salary anywhere, then normalize
+    salary = ""
     m = SALARY_RE.search(text)
-    salary = norm(m.group("salary")) if m else ""
+    if m:
+        raw_sal = f"{m.group('from')} {m.group('cur')} dan {m.group('to')} gacha"
+        salary = normalize_itmarket_salary(raw_sal)
 
     work_style = ", ".join([ws for ws in WORK_STYLES if ws in text]) or ""
     employment_type = next((et for et in EMP_TYPES if et in text), "")
@@ -457,15 +514,14 @@ def parse_detail(job_url: str, soup: BeautifulSoup) -> dict:
         "job_title": job_title,
         "location": meta["location"],
         "skills": skills_final,
-        "salary": meta["salary"],
+        "salary": meta["salary"],  # ✅ normalized
         "education": "",
         "job_type": job_type,
         "company_name": company_name,
         "job_url": job_url,
         "description": full_description,
-        "job_subtitle": meta_subtitle,   # meta subtitle
+        "job_subtitle": meta_subtitle,
         "posted_date": posted_date,
-        # ✅ search_query will be attached later
         "search_query": "",
     }
 
@@ -491,15 +547,10 @@ def matched_keywords(job: dict, keywords: list[str]) -> list[str]:
         job.get("job_subtitle", ""),
         job.get("company_name", ""),
     ])
-    hits = [kw for kw in keywords if keyword_match_text(hay, kw)]
-    return hits
+    return [kw for kw in keywords if keyword_match_text(hay, kw)]
 
 
 def pick_primary_query(hits: list[str]) -> str:
-    """
-    ✅ Choose ONE keyword to store.
-    priority: longer keyword first (more specific)
-    """
     if not hits:
         return ""
     hits_sorted = sorted(hits, key=lambda x: len(str(x)), reverse=True)
@@ -515,7 +566,6 @@ def main():
     with open("job_list.json", "r", encoding="utf-8") as f:
         keywords = json.load(f)
 
-    # normalize keywords list
     if isinstance(keywords, dict):
         for k in ("jobs", "keywords", "list"):
             if k in keywords and isinstance(keywords[k], list):
@@ -552,13 +602,12 @@ def main():
             if not hits:
                 continue
 
-            # ✅ attach search_query from job_list.json
             job["search_query"] = pick_primary_query(hits)
 
             ok = save_to_database(job)
             if ok:
                 inserted += 1
-                print(f"SAVED: {job['job_id']} | {job.get('job_title')} | search_query={job['search_query']} | hits={hits}")
+                print(f"SAVED: {job['job_id']} | {job.get('job_title')} | salary={job.get('salary')} | search_query={job['search_query']}")
             else:
                 duplicates += 1
                 print(f"DUP: {job['job_id']}")
