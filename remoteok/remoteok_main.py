@@ -4,7 +4,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import List, Tuple, Set, Optional
+from typing import List, Tuple, Set, Optional, Dict
 
 import psycopg2
 from dotenv import load_dotenv
@@ -89,19 +89,30 @@ def normalize_salary_k_range(raw: Optional[str]) -> Optional[str]:
     return out
 
 
-# ================== COUNTRY RESOLVER (CITY -> COUNTRY, OFFLINE) ==================
+# ================== COUNTRY RESOLVER (OFFLINE, NAME + CODE) ==================
 gc = geonamescache.GeonamesCache()
 _CITIES = gc.get_cities()
 _COUNTRIES = gc.get_countries()
 
 # city_name_lower -> set(country_code)
-_CITY_TO_CC = {}
+_CITY_TO_CC: Dict[str, Set[str]] = {}
 for _id, c in _CITIES.items():
     name = (c.get("name") or "").strip().lower()
     cc = (c.get("countrycode") or "").strip().upper()
     if not name or not cc:
         continue
     _CITY_TO_CC.setdefault(name, set()).add(cc)
+
+# extra synonyms to improve hit rate
+EXTRA_CITY_ALIASES = {
+    "sf": "san francisco",
+    "nyc": "new york",
+    "la": "los angeles",
+    "dc": "washington",
+}
+for k, v in EXTRA_CITY_ALIASES.items():
+    if v in _CITY_TO_CC:
+        _CITY_TO_CC.setdefault(k, set()).update(_CITY_TO_CC[v])
 
 US_STATE_ABBR = {
     "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id", "il", "in", "ia", "ks", "ky", "la",
@@ -115,99 +126,176 @@ CA_PROVINCES = {
     "northwest territories", "nunavut", "yukon"
 }
 
+# memory cache to avoid repeating work
+_LOCATION_CACHE: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+
+
 def _cc_to_country_name(cc: str) -> Optional[str]:
     cc = (cc or "").upper().strip()
     if not cc:
         return None
+
     info = _COUNTRIES.get(cc)
     if info and info.get("name"):
         return info["name"]
+
     obj = pycountry.countries.get(alpha_2=cc)
     return obj.name if obj else None
 
 
-def extract_countries_from_location(location: Optional[str]) -> Optional[str]:
+def _country_code_from_text(token: str) -> Optional[str]:
+    t = (token or "").strip()
+    if not t:
+        return None
+    low = t.lower()
+
+    # quick aliases
+    if low in {"us", "u.s.", "usa", "united states", "united states of america"}:
+        return "US"
+    if low in {"uk", "u.k.", "united kingdom", "britain", "england"}:
+        return "GB"
+    if low in {"uae", "united arab emirates"}:
+        return "AE"
+
+    # 2-letter code
+    if re.fullmatch(r"[a-z]{2}", low):
+        cc = low.upper()
+        if pycountry.countries.get(alpha_2=cc):
+            return cc
+        return None
+
+    # 3-letter code -> convert to alpha_2
+    if re.fullmatch(r"[a-z]{3}", low):
+        obj = pycountry.countries.get(alpha_3=low.upper())
+        return obj.alpha_2 if obj else None
+
+    # fuzzy by name
+    try:
+        matches = pycountry.countries.search_fuzzy(t)
+        if matches:
+            return matches[0].alpha_2
+    except Exception:
+        pass
+
+    return None
+
+
+def extract_country_name_and_code(location: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Returns: "United States" or "United States; Canada" or "Worldwide" etc.
+    Returns:
+      country_name: "United States; Canada"
+      country_code: "US; CA"
     """
     if not location:
-        return None
+        return None, None
 
     s = location.strip()
     if not s:
-        return None
+        return None, None
 
-    low = s.lower()
+    cache_key = s.lower().strip()
+    if cache_key in _LOCATION_CACHE:
+        return _LOCATION_CACHE[cache_key]
 
-    # premium garbage
+    low = cache_key
+
     if "upgrade to premium" in low:
-        return None
+        _LOCATION_CACHE[cache_key] = (None, None)
+        return None, None
 
-    # worldwide
-    if "🌏" in s or "worldwide" in low:
-        return "Worldwide"
+    # worldwide/global
+    if "🌏" in s or "worldwide" in low or "global" in low or "anywhere" in low:
+        res = ("Worldwide", "WW")
+        _LOCATION_CACHE[cache_key] = res
+        return res
 
-    # regions
-    regions = []
+    # regions (optional)
+    region_pairs: List[Tuple[str, str]] = []
     if "europe" in low:
-        regions.append("Europe")
+        region_pairs.append(("Europe", "EU"))
     if "asia" in low:
-        regions.append("Asia")
+        region_pairs.append(("Asia", "AS"))
+    if "latam" in low or "latin america" in low:
+        region_pairs.append(("Latin America", "LA"))
 
-    # normalize separators:
-    # "Denver, CO;San Francisco, CA;Toronto, Ontario, CAN"
-    # split by ; then by comma
+    # cleanup
+    low = low.replace("&", " and ")
+    low = re.sub(r"\bor\s+remote\b", " remote ", low)
+    low = re.sub(r"\bor\b", " ", low)
+    low = re.sub(r"\s+", " ", low).strip()
+
     chunks = re.split(r"[;|/]", low)
     chunks = [c.strip() for c in chunks if c.strip()]
 
-    found_cc = set()
+    found_cc: Set[str] = set()
+    found_remote = False
 
     for chunk in chunks:
-        # further split by comma
+        if "remote" in chunk:
+            found_remote = True
+
         parts = [p.strip() for p in chunk.split(",") if p.strip()]
-
-        # direct country keywords
         joined = " ".join(parts)
-        if re.search(r"\b(united states|usa)\b", joined):
-            found_cc.add("US")
-        if re.search(r"\b(united kingdom|uk|england|britain)\b", joined):
-            found_cc.add("GB")
-        if re.search(r"\b(canada|can)\b", joined):
-            found_cc.add("CA")
 
-        # state/province detection
+        # direct country tokens
         for p in parts:
-            if p in US_STATE_ABBR:
+            cc = _country_code_from_text(p)
+            if cc:
+                found_cc.add(cc)
+
+        cc2 = _country_code_from_text(joined)
+        if cc2:
+            found_cc.add(cc2)
+
+        # US states / CA provinces
+        for p in parts:
+            p2 = p.lower()
+            if p2 in US_STATE_ABBR:
                 found_cc.add("US")
-            if p in CA_PROVINCES:
+            if p2 in CA_PROVINCES:
                 found_cc.add("CA")
 
-        # city detection: prefer first city-like part
+        # city -> countrycode (geonamescache)
         if parts:
-            city_candidate = parts[0].strip()
+            city_candidate = parts[0].strip().lower()
+            city_candidate = EXTRA_CITY_ALIASES.get(city_candidate, city_candidate)
             if city_candidate in _CITY_TO_CC:
                 for cc in _CITY_TO_CC[city_candidate]:
                     found_cc.add(cc)
 
-        # if chunk itself is a city (no commas)
-        if chunk in _CITY_TO_CC:
-            for cc in _CITY_TO_CC[chunk]:
+        c2 = chunk.strip().lower()
+        c2 = EXTRA_CITY_ALIASES.get(c2, c2)
+        if c2 in _CITY_TO_CC:
+            for cc in _CITY_TO_CC[c2]:
                 found_cc.add(cc)
 
-    # countries -> names
-    countries = [_cc_to_country_name(cc) for cc in sorted(found_cc)]
-    countries = [c for c in countries if c]
+    # build outputs
+    name_out: List[str] = []
+    code_out: List[str] = []
 
-    out = []
-    # keep regions first, then countries
-    for r in regions:
-        if r not in out:
-            out.append(r)
-    for c in countries:
-        if c not in out:
-            out.append(c)
+    for rn, rc in region_pairs:
+        if rn not in name_out:
+            name_out.append(rn)
+        if rc not in code_out:
+            code_out.append(rc)
 
-    return "; ".join(out) if out else None
+    if found_remote and not found_cc and not region_pairs:
+        name_out.append("Remote")
+        code_out.append("REMOTE")
+
+    for cc in sorted(found_cc):
+        cname = _cc_to_country_name(cc)
+        if cname and cname not in name_out:
+            name_out.append(cname)
+        if cc and cc not in code_out:
+            code_out.append(cc)
+
+    res = (
+        "; ".join(name_out) if name_out else None,
+        "; ".join(code_out) if code_out else None
+    )
+    _LOCATION_CACHE[cache_key] = res
+    return res
 
 
 # ================== DB ==================
@@ -238,6 +326,7 @@ def ensure_table_exists(conn):
         company_name TEXT,
         location TEXT,
         country TEXT,
+        country_code TEXT,
         salary TEXT,
         job_type TEXT,
         skills TEXT,
@@ -258,6 +347,7 @@ def ensure_table_exists(conn):
         cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS job_subtitle TEXT NULL;")
         cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS page INT;")
         cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS country TEXT;")
+        cur.execute("ALTER TABLE public.remoteok ADD COLUMN IF NOT EXISTS country_code TEXT;")
     conn.commit()
 
 
@@ -267,25 +357,26 @@ def insert_rows(conn, rows: List[Tuple]) -> int:
 
     sql = """
     INSERT INTO public.remoteok (
-        job_id, source, job_title, company_name, location, country,
+        job_id, source, job_title, company_name, location, country, country_code,
         salary, job_type, skills, education, job_url, page,
         posted_at, posted_date, job_subtitle
     )
     VALUES %s
     ON CONFLICT (job_id, source) DO UPDATE SET
-        job_title    = EXCLUDED.job_title,
-        company_name = EXCLUDED.company_name,
-        location     = EXCLUDED.location,
-        country      = COALESCE(EXCLUDED.country, public.remoteok.country),
-        salary       = EXCLUDED.salary,
-        job_type     = EXCLUDED.job_type,
-        skills       = EXCLUDED.skills,
-        education    = EXCLUDED.education,
-        job_url      = EXCLUDED.job_url,
-        page         = EXCLUDED.page,
-        posted_at    = COALESCE(EXCLUDED.posted_at, public.remoteok.posted_at),
-        posted_date  = COALESCE(EXCLUDED.posted_date, public.remoteok.posted_date),
-        job_subtitle = COALESCE(EXCLUDED.job_subtitle, public.remoteok.job_subtitle);
+        job_title     = EXCLUDED.job_title,
+        company_name  = EXCLUDED.company_name,
+        location      = EXCLUDED.location,
+        country       = COALESCE(EXCLUDED.country, public.remoteok.country),
+        country_code  = COALESCE(EXCLUDED.country_code, public.remoteok.country_code),
+        salary        = EXCLUDED.salary,
+        job_type      = EXCLUDED.job_type,
+        skills        = EXCLUDED.skills,
+        education     = EXCLUDED.education,
+        job_url       = EXCLUDED.job_url,
+        page          = EXCLUDED.page,
+        posted_at     = COALESCE(EXCLUDED.posted_at, public.remoteok.posted_at),
+        posted_date   = COALESCE(EXCLUDED.posted_date, public.remoteok.posted_date),
+        job_subtitle  = COALESCE(EXCLUDED.job_subtitle, public.remoteok.job_subtitle);
     """
     with conn.cursor() as cur:
         execute_values(cur, sql, rows, page_size=250)
@@ -419,9 +510,9 @@ def extract_posted_at_from_tr(tr) -> Optional[datetime.datetime]:
 # ================== ROW EXTRACTION ==================
 def extract_rows(driver, page: int, job_subtitle: str) -> List[Tuple]:
     """
-    Rows:
-      (job_id, source, title, company, loc, country, sal, job_type,
-       skills, edu, link, page, posted_at, posted_date, job_subtitle)
+    Rows tuple (16 values):
+      (job_id, source, title, company, loc, country, country_code, sal,
+       job_type, skills, edu, link, page, posted_at, posted_date, job_subtitle)
     """
     rows = []
     trs = driver.find_elements(By.CSS_SELECTOR, "tr.job")
@@ -450,8 +541,8 @@ def extract_rows(driver, page: int, job_subtitle: str) -> List[Tuple]:
             if loc_els:
                 loc = safe_text(loc_els[0]) or None
 
-            # ✅ country from location (city->country)
-            country = extract_countries_from_location(loc)
+            # ✅ country + country_code
+            country, country_code = extract_country_name_and_code(loc)
 
             sal = None
             sal_els = tr.find_elements(By.CSS_SELECTOR, ".salary")
@@ -489,11 +580,12 @@ def extract_rows(driver, page: int, job_subtitle: str) -> List[Tuple]:
                     title,
                     company,
                     loc,
-                    country,   # ✅ NEW
+                    country,
+                    country_code,
                     sal,
                     job_type,
                     skills,
-                    None,
+                    None,   # education
                     link,
                     page,
                     posted_at,
