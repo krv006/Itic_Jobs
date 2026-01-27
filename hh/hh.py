@@ -4,6 +4,7 @@ import os
 import re
 import time
 from urllib.parse import urlparse, parse_qs, unquote_plus, quote_plus
+from typing import Optional, Tuple, Set, Dict, List
 
 import psycopg2
 import undetected_chromedriver as uc
@@ -12,6 +13,10 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+
+# ✅ offline country resolver
+import geonamescache
+import pycountry
 
 load_dotenv()
 
@@ -89,10 +94,8 @@ _PROF_MAP = {
 
 _TEXT_CACHE: dict[str, str] = {}
 
-
 def _has_cyrillic(text: str) -> bool:
     return bool(text) and bool(re.search(r"[А-Яа-яЁё]", text))
-
 
 def _translit_ru_to_lat(text: str) -> str:
     out = []
@@ -106,7 +109,6 @@ def _translit_ru_to_lat(text: str) -> str:
         else:
             out.append(ch)
     return "".join(out)
-
 
 def to_english(text: str) -> str:
     if not text:
@@ -153,7 +155,6 @@ def to_english(text: str) -> str:
     _TEXT_CACHE[s] = res
     return res
 
-
 def normalize_skills_csv(skills_csv: str) -> str:
     if not skills_csv:
         return ""
@@ -166,22 +167,9 @@ def normalize_skills_csv(skills_csv: str) -> str:
             seen.add(en)
     return ",".join(out)
 
-
 def normalize_salary_range(s: str) -> str:
-    """
-    Output: only digits + spaces + dash, currency at end if present
-
-    Examples:
-      "ot 400 000 do 700 000 ₸ per month, net" -> "400 000 - 700 000 ₸"
-      "ot 900 $ per month, net"                -> "900 - $"
-      "do 150 000 ₽ per month, net"            -> "- 150 000 ₽"
-      "150 000 ₽ per month, net"               -> "150 000 ₽"
-      "ot 1 000 do 1 100 Br per month, net"    -> "1 000 - 1 100 Br"
-      ""                                       -> ""
-    """
     if not s:
         return ""
-
     raw = s.strip()
     if not raw:
         return ""
@@ -197,7 +185,7 @@ def normalize_salary_range(s: str) -> str:
         if sym_m:
             cur = sym_m.group(0)
 
-    def _num_after(keyword: str) -> str | None:
+    def _num_after(keyword: str) -> Optional[str]:
         m = re.search(rf"\b{keyword}\b\s*([\d\s]+)", t)
         if not m:
             return None
@@ -226,6 +214,178 @@ def normalize_salary_range(s: str) -> str:
 
 
 # ----------------------------
+# COUNTRY RESOLVER (OFFLINE) for HH
+# ----------------------------
+gc = geonamescache.GeonamesCache()
+_CITIES = gc.get_cities()
+_COUNTRIES = gc.get_countries()
+
+_CITY_TO_CC: Dict[str, Set[str]] = {}
+for _id, c in _CITIES.items():
+    name = (c.get("name") or "").strip().lower()
+    cc = (c.get("countrycode") or "").strip().upper()
+    if not name or not cc:
+        continue
+    _CITY_TO_CC.setdefault(name, set()).add(cc)
+
+EXTRA_CITY_ALIASES = {
+    "sf": "san francisco",
+    "nyc": "new york",
+    "la": "los angeles",
+    "dc": "washington",
+}
+for k, v in EXTRA_CITY_ALIASES.items():
+    if v in _CITY_TO_CC:
+        _CITY_TO_CC.setdefault(k, set()).update(_CITY_TO_CC[v])
+
+US_STATE_ABBR = {
+    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id", "il", "in", "ia", "ks", "ky", "la",
+    "me", "md", "ma", "mi", "mn", "ms", "mo", "mt", "ne", "nv", "nh", "nj", "nm", "ny", "nc", "nd", "oh", "ok",
+    "or", "pa", "ri", "sc", "sd", "tn", "tx", "ut", "vt", "va", "wa", "wv", "wi", "wy", "dc"
+}
+
+CA_PROVINCES = {
+    "ontario", "quebec", "british columbia", "alberta", "manitoba", "saskatchewan",
+    "nova scotia", "new brunswick", "newfoundland and labrador", "prince edward island",
+    "northwest territories", "nunavut", "yukon"
+}
+
+_LOCATION_CACHE: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+
+def _cc_to_country_name(cc: str) -> Optional[str]:
+    cc = (cc or "").upper().strip()
+    if not cc:
+        return None
+    info = _COUNTRIES.get(cc)
+    if info and info.get("name"):
+        return info["name"]
+    obj = pycountry.countries.get(alpha_2=cc)
+    return obj.name if obj else None
+
+def _country_code_from_text(token: str) -> Optional[str]:
+    t = (token or "").strip()
+    if not t:
+        return None
+    low = t.lower()
+
+    if low in {"us", "u.s.", "usa", "united states", "united states of america"}:
+        return "US"
+    if low in {"uk", "u.k.", "united kingdom", "britain", "england"}:
+        return "GB"
+    if low in {"uae", "united arab emirates"}:
+        return "AE"
+
+    # 2-letter code
+    if re.fullmatch(r"[a-z]{2}", low):
+        cc = low.upper()
+        if pycountry.countries.get(alpha_2=cc):
+            return cc
+        return None
+
+    # 3-letter -> alpha_2
+    if re.fullmatch(r"[a-z]{3}", low):
+        obj = pycountry.countries.get(alpha_3=low.upper())
+        return obj.alpha_2 if obj else None
+
+    # fuzzy
+    try:
+        matches = pycountry.countries.search_fuzzy(t)
+        if matches:
+            return matches[0].alpha_2
+    except Exception:
+        pass
+
+    return None
+
+def extract_country_name_and_code_from_location(location: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Input location example (after to_english):
+      "Tashkent", "Almaty", "Tashkent, Uzbekistan", "Uzbekistan", "UZ", etc.
+    Output:
+      ("Uzbekistan", "UZ")
+      ("Kazakhstan", "KZ")
+      ("United States; Canada", "US; CA")
+    """
+    if not location:
+        return None, None
+
+    s = location.strip()
+    if not s:
+        return None, None
+
+    key = s.lower()
+    if key in _LOCATION_CACHE:
+        return _LOCATION_CACHE[key]
+
+    low = key
+
+    # normalize separators and noise
+    low = low.replace("&", " and ")
+    low = re.sub(r"\bor\b", " ", low)
+    low = re.sub(r"\s+", " ", low).strip()
+
+    chunks = re.split(r"[;|/]", low)
+    chunks = [c.strip() for c in chunks if c.strip()]
+
+    found_cc: Set[str] = set()
+
+    for chunk in chunks:
+        parts = [p.strip() for p in chunk.split(",") if p.strip()]
+        joined = " ".join(parts)
+
+        # detect codes/names directly
+        for p in parts:
+            cc = _country_code_from_text(p)
+            if cc:
+                found_cc.add(cc)
+
+        cc2 = _country_code_from_text(joined)
+        if cc2:
+            found_cc.add(cc2)
+
+        # detect US/CA by state/province
+        for p in parts:
+            p2 = p.lower()
+            if p2 in US_STATE_ABBR:
+                found_cc.add("US")
+            if p2 in CA_PROVINCES:
+                found_cc.add("CA")
+
+        # city->country via geonamescache (first part)
+        if parts:
+            city = parts[0].lower().strip()
+            city = EXTRA_CITY_ALIASES.get(city, city)
+            if city in _CITY_TO_CC:
+                for cc in _CITY_TO_CC[city]:
+                    found_cc.add(cc)
+
+        # whole chunk as city
+        c2 = chunk.lower().strip()
+        c2 = EXTRA_CITY_ALIASES.get(c2, c2)
+        if c2 in _CITY_TO_CC:
+            for cc in _CITY_TO_CC[c2]:
+                found_cc.add(cc)
+
+    if not found_cc:
+        res = (None, None)
+        _LOCATION_CACHE[key] = res
+        return res
+
+    names: List[str] = []
+    codes: List[str] = []
+    for cc in sorted(found_cc):
+        cname = _cc_to_country_name(cc)
+        if cname and cname not in names:
+            names.append(cname)
+        if cc not in codes:
+            codes.append(cc)
+
+    res = ("; ".join(names), "; ".join(codes))
+    _LOCATION_CACHE[key] = res
+    return res
+
+
+# ----------------------------
 # DB
 # ----------------------------
 conn = psycopg2.connect(
@@ -238,9 +398,7 @@ conn = psycopg2.connect(
 conn.autocommit = True
 cursor = conn.cursor()
 
-
 def create_table_if_not_exists():
-    # ✅ id is primary key; job_id stays UNIQUE for dedup
     cursor.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -248,6 +406,8 @@ def create_table_if_not_exists():
             job_id TEXT NOT NULL UNIQUE,
             job_title TEXT,
             location TEXT,
+            country TEXT,
+            country_code TEXT,
             skills TEXT,
             salary TEXT,
             education TEXT,
@@ -263,11 +423,15 @@ def create_table_if_not_exists():
         """
     )
 
-    # safety for existing table (if you already had old schema)
+    # safety for existing table
     cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS id BIGSERIAL;")
     cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();")
     cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS job_subtitle TEXT;")
     cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS search_query TEXT;")
+
+    # ✅ NEW
+    cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS country TEXT;")
+    cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS country_code TEXT;")
 
     cursor.execute(
         f"""
@@ -285,20 +449,20 @@ def create_table_if_not_exists():
         """
     )
 
-
 def save_to_database(data: dict):
-    # ✅ conflict on job_id (unique) NOT on id
     cursor.execute(
         f"""
         INSERT INTO {TABLE_NAME} (
-            job_id, job_title, location, skills, salary,
+            job_id, job_title, location, country, country_code, skills, salary,
             education, job_type, company_name, job_url,
             source, posted_date, job_subtitle, search_query
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (job_id) DO UPDATE SET
             job_title    = EXCLUDED.job_title,
             location     = EXCLUDED.location,
+            country      = COALESCE(EXCLUDED.country, {TABLE_NAME}.country),
+            country_code = COALESCE(EXCLUDED.country_code, {TABLE_NAME}.country_code),
             skills       = EXCLUDED.skills,
             salary       = EXCLUDED.salary,
             education    = EXCLUDED.education,
@@ -314,6 +478,8 @@ def save_to_database(data: dict):
             data["job_id"],
             data["job_title"],
             data["location"],
+            data.get("country"),
+            data.get("country_code"),
             data["skills"],
             data["salary"],
             data["education"],
@@ -342,7 +508,6 @@ def create_driver():
     options.add_argument("--disable-blink-features=AutomationControlled")
     return uc.Chrome(options=options)
 
-
 def safe_text(driver, xpath: str) -> str:
     try:
         return driver.find_element(By.XPATH, xpath).text.strip()
@@ -356,20 +521,12 @@ def safe_text(driver, xpath: str) -> str:
 def is_valid_job_id(job_id: str) -> bool:
     return bool(job_id) and job_id.isdigit() and len(job_id) >= 6
 
-
 def is_valid_job_title(title: str) -> bool:
     if not title or len(title) < 5:
         return False
     bad_words = (
-        "найдено",
-        "vacancy",
-        "employers",
-        "работодател",
-        "ооо ",
-        "тоо ",
-        "ип ",
-        "ao ",
-        "ltd",
+        "найдено", "vacancy", "employers", "работодател",
+        "ооо ", "тоо ", "ип ", "ao ", "ltd",
     )
     t = title.lower()
     return not any(bad in t for bad in bad_words)
@@ -395,8 +552,7 @@ _RU_MONTHS = {
     "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
 }
 
-
-def parse_posted_date_from_text(text: str) -> datetime.date | None:
+def parse_posted_date_from_text(text: str) -> Optional[datetime.date]:
     if not text:
         return None
     t = text.strip().lower()
@@ -421,7 +577,6 @@ def parse_posted_date_from_text(text: str) -> datetime.date | None:
             return datetime.date(year, mon, day)
 
     return None
-
 
 def get_hh_posted_date(driver) -> datetime.date:
     candidates = []
@@ -452,9 +607,9 @@ def get_hh_posted_date(driver) -> datetime.date:
 
 
 # ----------------------------
-# SEARCH PAGE URLS (FIX: always goes 1st, 2nd, 3rd job...)
+# SEARCH PAGE URLS
 # ----------------------------
-def get_search_result_urls(driver, wait) -> list[str]:
+def get_search_result_urls(driver, wait) -> List[str]:
     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[data-qa='serp-item__title']")))
     time.sleep(0.2)
 
@@ -522,11 +677,16 @@ def get_hh_vacancies(jobs_list):
                     raw_company = safe_text(driver, "//div[@data-qa='vacancy-company__details']")
 
                     job_title = to_english(raw_title)
+
+                    # normalize to english first
                     location = to_english(raw_location)
                     skills = normalize_skills_csv(raw_skills)
                     salary = normalize_salary_range(to_english(raw_salary))
                     job_type = to_english(raw_job_type)
                     company_name = to_english(raw_company)
+
+                    # ✅ country + code from location
+                    country, country_code = extract_country_name_and_code_from_location(location)
 
                     search_query = extract_search_query_from_url(url)
 
@@ -534,6 +694,8 @@ def get_hh_vacancies(jobs_list):
                         "job_id": job_id,
                         "job_title": job_title,
                         "location": location,
+                        "country": country,
+                        "country_code": country_code,
                         "skills": skills,
                         "salary": salary,
                         "education": "",
@@ -547,7 +709,7 @@ def get_hh_vacancies(jobs_list):
                     }
 
                     save_to_database(data)
-                    print(f"SAVED: {job_id} | posted_date={posted_date} | q={job}")
+                    print(f"SAVED: {job_id} | posted_date={posted_date} | country_code={country_code} | q={job}")
 
                 page += 1
 
@@ -585,3 +747,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+"""
+pip install geonamescache pycountry
+"""
