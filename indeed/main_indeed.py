@@ -1,8 +1,11 @@
 import os
 import time
 import urllib.parse
+import json
+import traceback
 
 import psycopg2
+from psycopg2 import Error
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
 from selenium.common.exceptions import (
@@ -10,6 +13,7 @@ from selenium.common.exceptions import (
     StaleElementReferenceException,
     ElementClickInterceptedException,
     NoSuchWindowException,
+    WebDriverException,
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -21,11 +25,28 @@ load_dotenv()
 INDEED_HOME = "https://www.indeed.com/"
 DEFAULT_WAIT = 15
 
+# Country kodlari mapping
+COUNTRY_CODE_MAP = {
+    "UK": "GB",
+    "Japan": "JP",
+    "Germany": "DE",
+    "Poland": "PL",
+    "France": "FR",
+    "Switzerland": "CH",
+    "London": "GB",
+    "Philippines": "PH",
+    "United States": "US",
+    "China": "CN",
+    "Dubai": "AE",
+    "Abu Dhabi": "AE",
+    "Uzbekistan": "UZ",
+    "Kazakhstan": "KZ"
+}
 
 # ----------------------------
 # Driver
 # ----------------------------
-def create_driver(headless: bool = False, version_main: int | None = None):
+def create_driver(headless: bool = False):
     options = uc.ChromeOptions()
     if headless:
         options.add_argument("--headless=new")
@@ -39,121 +60,113 @@ def create_driver(headless: bool = False, version_main: int | None = None):
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 
-    driver = uc.Chrome(options=options, version_main=version_main) if version_main else uc.Chrome(options=options)
+    driver = uc.Chrome(options=options)
     driver.set_page_load_timeout(60)
     return driver
-
 
 def wait(driver, t=DEFAULT_WAIT):
     return WebDriverWait(driver, t)
 
-
 # ----------------------------
-# Env + DB (Postgres)
+# Env + DB
 # ----------------------------
 def _env_required(key: str) -> str:
     val = os.getenv(key)
     if not val:
-        raise RuntimeError(f".env da {key} topilmadi yoki bo‘sh!")
+        raise RuntimeError(f".env da {key} topilmadi!")
     return val
 
-
 def open_db():
-    """
-    Supports either:
-      - DATABASE_URL=postgresql://user:pass@host:port/db
-    or
-      - DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
-    """
     db_url = os.getenv("DATABASE_URL", "").strip()
-
     if db_url:
         conn = psycopg2.connect(db_url)
     else:
-        host = _env_required("DB_HOST").strip()
-        port = _env_required("DB_PORT").strip()
-        dbname = _env_required("DB_NAME").strip()
-        user = _env_required("DB_USER").strip()
-        password = _env_required("DB_PASSWORD").strip()
+        host = _env_required("DB_HOST")
+        port = _env_required("DB_PORT")
+        dbname = _env_required("DB_NAME")
+        user = _env_required("DB_USER")
+        password = _env_required("DB_PASSWORD")
         conn = psycopg2.connect(
             host=host, port=int(port), dbname=dbname, user=user, password=password
         )
-
     conn.autocommit = False
     return conn
 
-
 def ensure_indeed_table(conn):
-    ddl = """
-    CREATE TABLE IF NOT EXISTS indeed (
-        id BIGSERIAL PRIMARY KEY,
-        job_id VARCHAR(100) NOT NULL,
-        source VARCHAR(50) NOT NULL,
-        job_title VARCHAR(500),
-        company_name VARCHAR(500),
-        location VARCHAR(255),
-        salary VARCHAR(255),
-        job_type VARCHAR(255),
-        skills TEXT,
-        education VARCHAR(255),
-        job_url TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        CONSTRAINT ux_indeed_jobid_source UNIQUE (job_id, source)
-    );
-    """
     cur = conn.cursor()
-    cur.execute(ddl)
-    conn.commit()
-
+    try:
+        cur.execute("SELECT to_regclass('public.indeed');")
+        result = cur.fetchone()
+        if result[0] is None:
+            create_sql = """
+            CREATE TABLE indeed (
+                id BIGSERIAL PRIMARY KEY,
+                job_id VARCHAR(100) NOT NULL,
+                source VARCHAR(50) NOT NULL,
+                job_title TEXT,
+                company_name TEXT,
+                location TEXT,
+                salary TEXT,
+                job_type TEXT,
+                skills TEXT,
+                education TEXT,
+                job_url TEXT,
+                country TEXT,
+                country_code VARCHAR(2),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT ux_indeed_jobid_source UNIQUE (job_id, source)
+            );
+            """
+            cur.execute(create_sql)
+            conn.commit()
+            print("Jadval 'indeed' yangi yaratildi.")
+        else:
+            print("Jadval 'indeed' allaqachon mavjud.")
+    except Error as e:
+        conn.rollback()
+        print(f"Jadval tekshirish/yaratishda xato: {e}")
+        traceback.print_exc()
+    finally:
+        cur.close()
 
 def save_to_database(
-        conn,
-        job_id,
-        job_title,
-        location,
-        skills,
-        salary,
-        education,
-        job_type,
-        company_name,
-        job_url,
-        source,
+    conn,
+    job_id,
+    job_title,
+    location,
+    skills,
+    salary,
+    education,
+    job_type,
+    company_name,
+    job_url,
+    country,
+    country_code,
+    source="indeed.com",
 ):
-    # Upsert: DO NOTHING on duplicate (job_id, source)
     sql = """
     INSERT INTO indeed (
         job_id, source, job_title, company_name, location,
-        salary, job_type, skills, education, job_url
+        salary, job_type, skills, education, job_url, country, country_code
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (job_id, source) DO NOTHING;
     """
     try:
         cur = conn.cursor()
-        cur.execute(
-            sql,
-            (
-                job_id,
-                source,
-                job_title,
-                company_name,
-                location,
-                salary,
-                job_type,
-                skills,
-                education,
-                job_url,
-            ),
-        )
-        # rowcount: 1 => inserted, 0 => already exists
+        cur.execute(sql, (
+            job_id, source, job_title, company_name, location,
+            salary, job_type, skills, education, job_url, country, country_code
+        ))
         inserted = cur.rowcount == 1
         conn.commit()
+        if inserted:
+            print(f"  ✅ Saqlandi: {job_title[:60]} | {country} ({country_code})")
         return inserted
     except Exception as e:
         conn.rollback()
-        print(f"[DB ERROR] job_id={job_id} -> {e}")
+        print(f"[DB ERROR] {job_id} → {e}")
         return False
-
 
 # ----------------------------
 # Selenium helpers
@@ -163,354 +176,288 @@ def safe_click(driver, element):
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
         element.click()
         return True
-    except (ElementClickInterceptedException, StaleElementReferenceException):
+    except:
         try:
             driver.execute_script("arguments[0].click();", element)
             return True
-        except Exception:
+        except:
             return False
-    except Exception:
-        return False
-
-
-def js_click(driver, element):
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
-    driver.execute_script("arguments[0].click();", element)
-
 
 def get_text_safe(el):
     try:
         return (el.text or "").strip()
-    except Exception:
+    except:
         return ""
-
 
 def first_existing(driver_or_el, selectors, timeout=5):
     t_end = time.time() + timeout
     while time.time() < t_end:
         for by, sel in selectors:
-            els = driver_or_el.find_elements(by, sel)
-            if els:
-                return els[0]
+            try:
+                els = driver_or_el.find_elements(by, sel)
+                if els:
+                    return els[0]
+            except:
+                pass
         time.sleep(0.2)
     return None
-
 
 def normalize_job_url(href: str) -> str:
     if not href:
         return ""
     href = href.strip()
     if href.startswith("/"):
-        return urllib.parse.urljoin("https://www.indeed.com", href)
+        return "https://www.indeed.com" + href
     return href
-
 
 def get_job_id_from_url(url: str) -> str:
     if "vjk=" in url:
         return url.split("vjk=")[-1].split("&")[0]
-    return url.strip()[:100]
-
+    if "jk=" in url:
+        return url.split("jk=")[-1].split("&")[0]
+    return ""
 
 # ----------------------------
-# Login (Google) - from .env
+# Login Google — TO‘G‘RILANGAN VA MUSTAHKAMLANGAN
 # ----------------------------
 def login_google(driver) -> bool:
-    print("Logging into Indeed using Google...")
+    print("Indeed ga Google orqali kirish...")
 
     try:
-        wait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        # Sahifa yuklanishini kutish
+        wait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     except TimeoutException:
+        print("Sahifa yuklanmadi (timeout). Internet yoki brauzer muammosi bo'lishi mumkin.")
         return False
 
-    sign_in = first_existing(
-        driver,
-        [
-            (By.XPATH, "//a[contains(., 'Sign in') or contains(., 'Sign In')]"),
-            (By.CSS_SELECTOR, "a[href*='account/login']"),
-        ],
-        timeout=10,
-    )
-
-    if not sign_in:
-        print("Sign in link not found.")
+    try:
+        # Sign in tugmasini topish
+        sign_in = wait(driver, 20).until(
+            EC.element_to_be_clickable((By.XPATH, "//a[contains(., 'Sign in') or contains(., 'Sign In') or contains(., 'Log in')]"))
+        )
+        safe_click(driver, sign_in)
+        time.sleep(3)
+    except TimeoutException:
+        print("Sign in tugmasi topilmadi. Sahifani tekshiring.")
+        return False
+    except Exception as e:
+        print(f"Sign in tugmasini bosishda xato: {e}")
+        traceback.print_exc()
         return False
 
-    safe_click(driver, sign_in)
-    time.sleep(2)
-
-    google_btn = first_existing(
-        driver,
-        [
-            (By.ID, "login-google-button"),
-            (By.CSS_SELECTOR, "[data-testid='google-login-button']"),
-            (By.XPATH, "//button[contains(.,'Google') or contains(.,'Continue with Google')]"),
-        ],
-        timeout=15,
-    )
-
-    if not google_btn:
-        print("Google login button not found.")
+    try:
+        # Google tugmasi
+        google_btn = wait(driver, 20).until(
+            EC.element_to_be_clickable((By.ID, "login-google-button"))
+        )
+        safe_click(driver, google_btn)
+        time.sleep(4)
+    except TimeoutException:
+        print("Google tugmasi topilmadi.")
+        return False
+    except Exception as e:
+        print(f"Google tugmasini bosishda xato: {e}")
+        traceback.print_exc()
         return False
 
-    safe_click(driver, google_btn)
-    time.sleep(2)
+    # Yangi oyna ochilishini kutish va o'tish
+    try:
+        wait(driver, 15).until(lambda d: len(d.window_handles) > 1)
+        driver.switch_to.window(driver.window_handles[-1])
+        print("Google login oynasiga o'tildi.")
+    except TimeoutException:
+        print("Google login oynasi ochilmadi.")
+        return False
+    except Exception as e:
+        print(f"Oyna o'tkazishda xato: {e}")
+        return False
 
     email = _env_required("EMAIL")
     password = _env_required("EMAIL_PASSWORD")
 
     try:
-        wins = driver.window_handles
-        if len(wins) > 1:
-            driver.switch_to.window(wins[-1])
-    except NoSuchWindowException:
-        print("Google login window not available.")
-        return False
-
-    # account chooser
-    try:
-        use_another = driver.find_elements(By.XPATH, "//*[contains(.,'Use another account')]/..")
-        if use_another:
-            js_click(driver, use_another[0])
-            time.sleep(1)
-    except Exception:
-        pass
-
-    # EMAIL
-    try:
-        email_inp = wait(driver, 25).until(
+        # Email kiritish
+        email_inp = wait(driver, 30).until(
             EC.visibility_of_element_located((By.XPATH, "//input[@type='email' or @name='identifier']"))
         )
         email_inp.clear()
         email_inp.send_keys(email)
         email_inp.send_keys(Keys.ENTER)
-    except Exception as e:
-        print(f"Google email step failed: {e}")
-        return False
+        time.sleep(4)
 
-    # PASSWORD
-    try:
-        pwd_inp = wait(driver, 25).until(
-            EC.visibility_of_element_located((By.XPATH, "//input[@type='password' or @name='Passwd']"))
+        # Parol kiritish
+        pwd_inp = wait(driver, 30).until(
+            EC.visibility_of_element_located((By.XPATH, "//input[@type='password']"))
         )
-        try:
-            pwd_inp.click()
-            pwd_inp.send_keys(password)
-        except Exception:
-            js_click(driver, pwd_inp)
-            pwd_inp.send_keys(password)
-
+        pwd_inp.clear()
+        pwd_inp.send_keys(password)
         pwd_inp.send_keys(Keys.ENTER)
+        time.sleep(8)
 
-    except Exception as e:
-        try:
-            driver.save_screenshot("google_login_password_error.png")
-            print("Saved screenshot: google_login_password_error.png")
-        except Exception:
-            pass
-
-        print(f"Google password step failed: {e}")
+        # Asosiy oynaga qaytish
+        driver.switch_to.window(driver.window_handles[0])
+        time.sleep(5)
+        print("Login muvaffaqiyatli yakunlandi.")
+        return True
+    except TimeoutException as te:
+        print("Login sahifasi elementlari topilmadi (email/parol maydonlari).")
+        traceback.print_exc()
         return False
-
-    time.sleep(3)
-
-    try:
-        if len(driver.window_handles) > 1:
-            driver.switch_to.window(driver.window_handles[0])
-    except Exception:
-        pass
-
-    print("Login successful. Starting job scraping...")
-    return True
-
+    except Exception as e:
+        print(f"Login jarayonida jiddiy xato: {e}")
+        traceback.print_exc()
+        return False
 
 # ----------------------------
-# Job details (right panel)
+# Job details (oldin to'g'rilangan)
 # ----------------------------
 def read_job_details_from_right_panel(driver):
-    time.sleep(0.6)
+    time.sleep(1)
 
-    panel = (
-            first_existing(
-                driver,
-                [
-                    (By.ID, "jobsearch-ViewjobPaneWrapper"),
-                    (By.CSS_SELECTOR, "div#jobsearch-ViewjobPaneWrapper"),
-                    (By.CSS_SELECTOR, "div.jobsearch-RightPane"),
-                    (By.CSS_SELECTOR, "div.jobsearch-JobComponent"),
-                ],
-                timeout=3,
-            )
-            or driver
-    )
+    panel = driver
+    for sel in ["#jobsearch-ViewjobPaneWrapper", "div.jobsearch-RightPane", "div.jobsearch-JobComponent"]:
+        try:
+            panel = driver.find_element(By.CSS_SELECTOR, sel)
+            break
+        except:
+            pass
 
-    # salary
     salary = ""
-    pay_value = first_existing(
-        panel,
-        [
-            (By.XPATH, ".//*[normalize-space()='Pay']/following::*[self::span or self::div][1]"),
-            (By.XPATH, ".//*[normalize-space()='Pay']/following::*[contains(@class,'css')][1]"),
-        ],
-        timeout=2,
-    )
-    if pay_value:
-        salary = get_text_safe(pay_value)
-
-    if not salary:
-        header_pay = first_existing(
+    try:
+        pay_el = first_existing(
             panel,
             [
-                (By.XPATH, ".//*[contains(.,'$') and contains(.,'a year')]"),
-                (By.XPATH, ".//*[contains(.,'$') and contains(.,'an hour')]"),
+                (By.XPATH, ".//*[contains(@aria-label, 'Pay')]"),
+                (By.XPATH, ".//*[contains(., '$') and (contains(., 'year') or contains(., 'hour'))]"),
             ],
-            timeout=1,
+            timeout=3
         )
-        if header_pay:
-            txt = get_text_safe(header_pay)
-            salary = txt.split(" - ")[0].strip()
+        if pay_el:
+            salary = get_text_safe(pay_el).replace("Pay", "").replace("Employer est.", "").strip()
+    except:
+        pass
 
-    # company
     company = ""
-    el = first_existing(
-        panel,
-        [
-            (By.CSS_SELECTOR, "[data-testid='inlineHeader-companyName']"),
-            (By.XPATH, ".//*[@data-testid='inlineHeader-companyName']"),
-        ],
-        timeout=2,
-    )
-    if el:
-        company = get_text_safe(el)
-
-    # location
-    location = ""
-    el = first_existing(
-        panel,
-        [
-            (By.CSS_SELECTOR, "[data-testid='inlineHeader-companyLocation']"),
-            (By.XPATH, ".//*[@data-testid='inlineHeader-companyLocation']"),
-        ],
-        timeout=2,
-    )
-    if el:
-        location = get_text_safe(el)
-
-    # job type
-    job_type = ""
-    jt = first_existing(
-        panel,
-        [
-            (By.XPATH, ".//*[normalize-space()='Job type']/following::*[self::span or self::div][1]"),
-            (By.XPATH, ".//*[contains(@aria-label,'Job type')]"),
-        ],
-        timeout=2,
-    )
-    if jt:
-        job_type = get_text_safe(jt).replace("Job type", "").strip()
-
-    # skills
-    skills = ""
-    btn_more = first_existing(
-        panel,
-        [(By.XPATH, ".//button[contains(., 'show more') or contains(., '+ show more')]")],
-        timeout=1,
-    )
-    if btn_more:
-        safe_click(driver, btn_more)
-        time.sleep(0.3)
-
-    sk_el = first_existing(
-        panel,
-        [
-            (By.CSS_SELECTOR, "ul.js-match-insights-provider"),
-            (By.XPATH, ".//div[contains(@aria-label,'Skills')]//ul"),
-        ],
-        timeout=2,
-    )
-    if sk_el:
-        raw = get_text_safe(sk_el)
-        raw = (
-            raw.replace("Skills", "")
-            .replace("+ show more", "")
-            .replace("- show less", "")
-            .replace("(Required)", "")
-            .replace("\n", ",")
+    try:
+        company_el = first_existing(
+            panel,
+            [(By.CSS_SELECTOR, "[data-testid='inlineHeader-companyName']")],
+            timeout=2
         )
-        parts = [p.strip() for p in raw.split(",")]
-        parts = [p for p in parts if p and "Do you have" not in p]
-        skills = ",".join(parts)
+        if company_el:
+            company = get_text_safe(company_el)
+    except:
+        pass
 
-    # education
+    location = ""
+    try:
+        loc_el = first_existing(
+            panel,
+            [(By.CSS_SELECTOR, "[data-testid='inlineHeader-companyLocation']")],
+            timeout=2
+        )
+        if loc_el:
+            location = get_text_safe(loc_el)
+    except:
+        pass
+
+    job_type = ""
+    try:
+        jt_el = first_existing(
+            panel,
+            [(By.XPATH, ".//*[contains(@aria-label, 'Job type')]")],
+            timeout=2
+        )
+        if jt_el:
+            raw = get_text_safe(jt_el)
+            job_type = raw.replace("Job type", "").strip()
+    except:
+        pass
+
+    skills = ""
+    try:
+        more_btn = first_existing(
+            panel,
+            [(By.XPATH, ".//button[contains(., 'show more') or contains(., '+ show more')]")],
+            timeout=1
+        )
+        if more_btn:
+            safe_click(driver, more_btn)
+            time.sleep(0.5)
+
+        sk_el = first_existing(
+            panel,
+            [(By.CSS_SELECTOR, "[aria-label*='Skills'] ul, ul.js-match-insights-provider")],
+            timeout=2
+        )
+        if sk_el:
+            raw = get_text_safe(sk_el)
+            raw = raw.replace("Skills", "").replace("+ show more", "").replace("- show less", "").replace("(Required)", "")
+            parts = [p.strip() for p in raw.split("\n") if p.strip() and "Do you have" not in p]
+            skills = ", ".join(parts)
+    except:
+        pass
+
     education = "No Degree Required"
-    ed_el = first_existing(
-        panel,
-        [
-            (By.XPATH, ".//*[@aria-label='Education']"),
-            (By.XPATH, ".//*[contains(@aria-label,'Education')]"),
-        ],
-        timeout=2,
-    )
-    if ed_el:
-        raw = get_text_safe(ed_el)
-        raw = raw.replace("Education", "").replace("(Required)", "").replace("\n", ",")
-        parts = [p.strip() for p in raw.split(",")]
-        parts = [p for p in parts if p and "Do you have" not in p]
-        if parts:
-            education = ",".join(parts)
+    try:
+        ed_el = first_existing(
+            panel,
+            [(By.CSS_SELECTOR, "[aria-label*='Education']")],
+            timeout=2
+        )
+        if ed_el:
+            raw = get_text_safe(ed_el).replace("Education", "").replace("(Required)", "")
+            parts = [p.strip() for p in raw.split("\n") if p.strip() and "Do you have" not in p]
+            if parts:
+                education = ", ".join(parts)
+    except:
+        pass
 
     return company, location, salary, job_type, skills, education
-
 
 # ----------------------------
 # Pagination
 # ----------------------------
 def click_next_or_stop(driver) -> bool:
-    candidates = [
+    selectors = [
         (By.CSS_SELECTOR, "[data-testid='pagination-page-next']"),
-        (By.XPATH, "//*[@data-testid='pagination-page-next']"),
-        (By.CSS_SELECTOR, "a[aria-label='Next Page']"),
-        (By.CSS_SELECTOR, "button[aria-label='Next Page']"),
+        (By.CSS_SELECTOR, "a[aria-label*='Next']"),
         (By.XPATH, "//a[contains(@aria-label,'Next')]"),
-        (By.XPATH, "//button[contains(@aria-label,'Next')]"),
     ]
 
-    el = first_existing(driver, candidates, timeout=6)
+    el = None
+    for by, sel in selectors:
+        try:
+            el = wait(driver, 8).until(EC.element_to_be_clickable((by, sel)))
+            break
+        except:
+            pass
+
     if not el:
-        return False
-
-    aria_disabled = (el.get_attribute("aria-disabled") or "").lower()
-    if aria_disabled == "true":
-        return False
-
-    cls = (el.get_attribute("class") or "").lower()
-    if "disabled" in cls:
         return False
 
     return safe_click(driver, el)
 
-
 # ----------------------------
-# Scrape one keyword
+# Scrape keyword + country
 # ----------------------------
-def scrape_keyword(driver, conn, keyword: str, max_pages: int = 30):
+def scrape_keyword_country(driver, conn, keyword: str, country_name: str, country_code: str = "", max_pages: int = 5):
     q = urllib.parse.quote_plus(keyword)
-    base_url = f"https://www.indeed.com/jobs?q={q}&l=&sort=date&from=searchOnDesktopSerp"
-    print(f"\n[KEYWORD] {keyword} -> {base_url}")
+    l = urllib.parse.quote_plus(country_name)
+    base_url = f"https://www.indeed.com/jobs?q={q}&l={l}&sort=date"
+
+    print(f"\n[SEARCH] {keyword} | {country_name} ({country_code}) → {base_url}")
 
     driver.get(base_url)
+    time.sleep(4)
 
     try:
-        wait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    except TimeoutException:
-        print("[WARN] Page load timeout.")
-        return
-
-    try:
-        wait(driver, 25).until(
+        wait(driver, 20).until(
             EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'mosaic-provider-jobcards')]"))
         )
+        print("Job list topildi.")
     except TimeoutException:
-        print("[WARN] Job list not found (captcha / layout o‘zgargan bo‘lishi mumkin).")
+        print("[WARN] Job list topilmadi (CAPTCHA yoki blok).")
         return
 
     page = 0
@@ -518,49 +465,32 @@ def scrape_keyword(driver, conn, keyword: str, max_pages: int = 30):
 
     while page < max_pages:
         page += 1
-        print(f"[PAGE] {page}")
+        print(f"  [PAGE] {page} | {country_name}")
 
-        container = driver.find_element(By.XPATH, "//div[contains(@class,'mosaic-provider-jobcards')]")
-
-        # filter: only li that actually has a job title link
-        job_cards = container.find_elements(By.XPATH, ".//li[.//a[contains(@class,'jcs-JobTitle')]]")
-        if not job_cards:
-            print("[STOP] job cards topilmadi.")
+        try:
+            container = driver.find_element(By.XPATH, "//div[contains(@class,'mosaic-provider-jobcards')]")
+            job_cards = container.find_elements(By.XPATH, ".//li[.//a[contains(@class,'jcs-JobTitle')]]")
+        except:
+            print("  [STOP] Kartalar topilmadi.")
             break
 
-        for idx, card in enumerate(job_cards, start=1):
+        if not job_cards:
+            break
+
+        for card in job_cards:
             try:
-                title_link = None
-                for sel in [
-                    (By.XPATH, ".//a[contains(@class,'jcs-JobTitle')]"),
-                    (By.CSS_SELECTOR, "a.jcs-JobTitle"),
-                    (By.XPATH, ".//a[contains(@href,'/viewjob')]"),
-                ]:
-                    els = card.find_elements(*sel)
-                    if els:
-                        title_link = els[0]
-                        break
-
-                if not title_link:
-                    continue
-
+                title_link = card.find_element(By.XPATH, ".//a[contains(@class,'jcs-JobTitle')]")
                 title = get_text_safe(title_link)
                 if not title:
                     continue
 
-                # IMPORTANT FIX: use href for stable job_url/job_id (URL often doesn't change on right-pane click)
                 href = normalize_job_url(title_link.get_attribute("href") or "")
-                if not href:
-                    # fallback, but usually href exists
-                    href = driver.current_url
-
                 job_id = get_job_id_from_url(href)
-
-                # click to load right panel details
-                if not safe_click(driver, title_link):
+                if not job_id:
                     continue
 
-                time.sleep(0.6)
+                safe_click(driver, title_link)
+                time.sleep(1.2)
 
                 company, location, salary, job_type, skills, education = read_job_details_from_right_panel(driver)
 
@@ -575,75 +505,82 @@ def scrape_keyword(driver, conn, keyword: str, max_pages: int = 30):
                     job_type=job_type,
                     company_name=company,
                     job_url=href,
+                    country=country_name,
+                    country_code=country_code,
                     source="indeed.com",
                 )
 
                 if saved:
                     total_saved += 1
-                    print(f"  ✅ saved #{total_saved}: {title} | {company} | {location} | {salary}")
-                else:
-                    # already exists
-                    pass
 
-            except StaleElementReferenceException:
-                continue
             except Exception as e:
-                print(f"  [CARD ERROR] idx={idx} -> {e}")
+                print(f"  [CARD ERROR] {e}")
                 continue
-
-        # pagination: wait for new page after click
-        old_first = None
-        try:
-            old_first = container.find_element(By.CSS_SELECTOR, "a.jcs-JobTitle")
-        except Exception:
-            pass
 
         if not click_next_or_stop(driver):
-            print("[STOP] Next page yo‘q (oxirgi sahifa yoki pagination yo‘q).")
+            print("  [STOP] Keyingi sahifa yo'q.")
             break
 
-        if old_first:
-            try:
-                WebDriverWait(driver, 15).until(EC.staleness_of(old_first))
-            except Exception:
-                pass
+        time.sleep(2)
 
-        time.sleep(1.5)
-
-    print(f"[DONE] keyword='{keyword}' saved={total_saved}")
-
+    print(f"[DONE] {keyword} | {country_name} → saved: {total_saved}")
 
 # ----------------------------
-# Run
+# Main — Xatolarni yaxshiroq boshqarish
 # ----------------------------
 def main():
-    driver = create_driver(headless=False, version_main=None)
-    driver.get(INDEED_HOME)
-
-    if not login_google(driver):
-        print("Login failed. Exiting.")
-        driver.quit()
-        return
-
-    conn = open_db()
-    ensure_indeed_table(conn)
-
-    import json
-    with open("jobs-list.json", "r", encoding="utf-8") as f:
-        keywords = json.load(f)
-
+    driver = None
+    conn = None
     try:
-        for kw in keywords:
-            kw = str(kw).strip()
-            if kw:
-                scrape_keyword(driver, conn, kw, max_pages=30)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        driver.quit()
+        driver = create_driver(headless=False)
+        print("Brauzer ochildi.")
 
+        driver.get(INDEED_HOME)
+        time.sleep(3)
+
+        if not login_google(driver):
+            print("Login muvaffaqiyatsiz. Dastur to'xtatilmoqda.")
+            return
+
+        conn = open_db()
+        ensure_indeed_table(conn)
+
+        with open("jobs-list.json", "r", encoding="utf-8") as f:
+            keywords = json.load(f)
+
+        with open("countries.json", "r", encoding="utf-8") as f:
+            countries = json.load(f)
+
+        for keyword in keywords:
+            keyword = str(keyword).strip()
+            if not keyword:
+                continue
+
+            for country_name in countries:
+                country_name = country_name.strip()
+                country_code = COUNTRY_CODE_MAP.get(country_name, "")
+
+                if not country_code:
+                    print(f"[WARN] {country_name} uchun code topilmadi")
+
+                scrape_keyword_country(driver, conn, keyword, country_name, country_code)
+                time.sleep(12)
+
+    except Exception as e:
+        print(f"[MAIN ERROR] {e}")
+        traceback.print_exc()
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+        if driver:
+            try:
+                driver.quit()
+            except:
+                print("Brauzer yopilishida xato (lekin zararsiz)")
+        print("Dastur yakunlandi.")
 
 if __name__ == "__main__":
     main()
