@@ -35,18 +35,18 @@ COOKIES_PATH = BASE_DIR / "cookies.json"
 
 # ================== COUNTRY -> ISO3 CODE ==================
 COUNTRY_CODE_MAP = {
-    "UK": "GBR",
+    "UK": "UK",
     "Japan": "JPN",
     "Germany": "DEU",
     "Poland": "POL",
     "France": "FRA",
     "Switzerland": "CHE",
-    "London": "GBR",
+    "London": "UK",
     "Philippines": "PHL",
     "United States": "USA",
     "China": "CHN",
-    "Dubai": "ARE",
-    "Abu Dhabi": "ARE",
+    "Dubai": "AUE",
+    "Abu Dhabi": "AUE",
     "Uzbekistan": "UZB",
     "Kazakhstan": "KAZ",
 }
@@ -55,9 +55,25 @@ def get_country_code(country: str) -> str:
     return COUNTRY_CODE_MAP.get((country or "").strip(), "UNK")
 
 
-# ================== SALARY (STRICT) ==================
+# ================== SALARY (STRICT + DISPLAY) ==================
 CURRENCY_SIGNS = ["R$", "A$", "C$", "HK$", "$", "€", "£", "¥", "₽", "₩", "₹", "₺", "₫", "฿", "₴", "₦"]
-CURRENCY_CODES = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "SGD", "HKD", "RUB", "INR", "KRW"]
+CURRENCY_CODES = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "SGD", "HKD", "RUB", "INR", "KRW", "BRL"]
+
+CURRENCY_SYMBOL_MAP = {
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£",
+    "JPY": "¥",
+    "RUB": "₽",
+    "AUD": "A$",
+    "CAD": "C$",
+    "HKD": "HK$",
+    "SGD": "S$",
+    "KRW": "₩",
+    "INR": "₹",
+    "BRL": "R$",
+    "UNK": "",
+}
 
 def detect_currency(raw: str) -> str:
     if not raw:
@@ -66,6 +82,8 @@ def detect_currency(raw: str) -> str:
     if "A$" in raw or "AUD" in t: return "AUD"
     if "C$" in raw or "CAD" in t: return "CAD"
     if "HK$" in raw or "HKD" in t: return "HKD"
+    if "S$" in raw or "SGD" in t: return "SGD"
+    if "R$" in raw or "BRL" in t: return "BRL"
     if "$" in raw or "USD" in t: return "USD"
     if "€" in raw or "EUR" in t: return "EUR"
     if "£" in raw or "GBP" in t: return "GBP"
@@ -76,20 +94,30 @@ def detect_currency(raw: str) -> str:
     return "UNK"
 
 
-# 1) Belgili salary (ishonchli)
+# 1) Valyuta belgisi bor salary (ishonchli)
 SIGN_RANGE_RE = re.compile(
     r"""
-    (?:R\$|A\$|C\$|HK\$|\$|€|£|¥|₽|₩|₹|₺|₫|฿|₴|₦)
+    (?:R\$|A\$|C\$|HK\$|S\$|\$|€|£|¥|₽|₩|₹|₺|₫|฿|₴|₦)
     \s*\d+(?:[.,]\d+)?\s*[KM]?
     (?:\s*[-–—]\s*
-        (?:R\$|A\$|C\$|HK\$|\$|€|£|¥|₽|₩|₹|₺|₫|฿|₴|₦)?
+        (?:R\$|A\$|C\$|HK\$|S\$|\$|€|£|¥|₽|₩|₹|₺|₫|฿|₴|₦)?
         \s*\d+(?:[.,]\d+)?\s*[KM]?
     )?
     """,
     re.VERBOSE
 )
 
-# 2) K/M range belgisisiz, LEKIN faqat kontekst bilan (xatoni yo‘q qiladi)
+# 2) Currency code bilan
+CODE_RANGE_RE = re.compile(
+    r"""
+    \b(?:USD|EUR|GBP|JPY|AUD|CAD|SGD|HKD|RUB|INR|KRW|BRL)\b
+    \s*\d+(?:[.,]\d+)?\s*[KM]?
+    (?:\s*[-–—]\s*\d+(?:[.,]\d+)?\s*[KM]?)?
+    """,
+    re.VERBOSE | re.IGNORECASE
+)
+
+# 3) Belgisiz range, faqat context bilan (3D/501 ni yo‘q qiladi)
 CONTEXT_RANGE_RE = re.compile(
     r"""
     (?:pay|salary|estimated|estimate|compensation)
@@ -97,16 +125,6 @@ CONTEXT_RANGE_RE = re.compile(
     (\d+(?:[.,]\d+)?\s*[KM]?)
     \s*[-–—]\s*
     (\d+(?:[.,]\d+)?\s*[KM]?)
-    """,
-    re.VERBOSE | re.IGNORECASE
-)
-
-# 3) Currency code bilan (USD 76K - 101K)
-CODE_RANGE_RE = re.compile(
-    r"""
-    \b(?:USD|EUR|GBP|JPY|AUD|CAD|SGD|HKD|RUB|INR|KRW)\b
-    \s*\d+(?:[.,]\d+)?\s*[KM]?
-    (?:\s*[-–—]\s*\d+(?:[.,]\d+)?\s*[KM]?)?
     """,
     re.VERBOSE | re.IGNORECASE
 )
@@ -122,7 +140,7 @@ def to_int(num_str: str, unit: str):
 
 def normalize_salary(raw_text: str):
     """
-    OUTPUT: "GBP:30000-33000" / "USD:76000-101000" / "EUR:50000"
+    OUTPUT: "GBP:25000-35000" / "USD:76000-101000" / "EUR:50000"
     """
     if not raw_text:
         return None
@@ -134,9 +152,9 @@ def normalize_salary(raw_text: str):
     if m:
         snippet = m.group(0)
         cur = detect_currency(snippet)
+
         s = snippet
-        # remove currency signs
-        for sym in ["R$", "A$", "C$", "HK$"]:
+        for sym in ["R$", "A$", "C$", "HK$", "S$"]:
             s = s.replace(sym, "")
         for sym in ["$", "€", "£", "¥", "₽", "₩", "₹", "₺", "₫", "฿", "₴", "₦"]:
             s = s.replace(sym, "")
@@ -145,6 +163,7 @@ def normalize_salary(raw_text: str):
         nums = re.findall(r"(\d+(?:\.\d+)?)([KM]?)", s)
         if not nums:
             return None
+
         vals = [to_int(n, u) for (n, u) in nums[:2]]
         if len(vals) == 2:
             return f"{cur}:{vals[0]}-{vals[1]}"
@@ -155,17 +174,20 @@ def normalize_salary(raw_text: str):
     if m:
         snippet = m.group(0)
         cur = detect_currency(snippet)
+
         s = re.sub(rf"\b({'|'.join(CURRENCY_CODES)})\b", "", snippet, flags=re.IGNORECASE)
         s = s.replace(",", "").strip()
+
         nums = re.findall(r"(\d+(?:\.\d+)?)([KM]?)", s)
         if not nums:
             return None
+
         vals = [to_int(n, u) for (n, u) in nums[:2]]
         if len(vals) == 2:
             return f"{cur}:{vals[0]}-{vals[1]}"
         return f"{cur}:{vals[0]}"
 
-    # C) context-based (no symbols) -> ONLY if pay/salary word present
+    # C) context-based
     m = CONTEXT_RANGE_RE.search(txt)
     if m:
         a, b = m.group(1), m.group(2)
@@ -173,17 +195,43 @@ def normalize_salary(raw_text: str):
         n2 = re.findall(r"(\d+(?:[.,]\d+)?)([KM]?)", b.replace(",", ""))[0]
         v1 = to_int(n1[0], n1[1])
         v2 = to_int(n2[0], n2[1])
-        cur = detect_currency(txt)  # ko‘pincha UNK bo‘ladi
+        cur = detect_currency(txt)
         return f"{cur}:{v1}-{v2}"
 
     return None
 
 
+def salary_norm_to_display(salary_norm: str):
+    """
+    "GBP:25000-35000" -> "£25000-£35000"
+    "USD:76000-101000" -> "$76000-$101000"
+    "EUR:50000" -> "€50000"
+    """
+    if not salary_norm:
+        return None
+    s = salary_norm.strip()
+    if ":" not in s:
+        return s
+
+    code, rest = s.split(":", 1)
+    code = code.strip().upper()
+    sym = CURRENCY_SYMBOL_MAP.get(code, "")
+
+    if "-" in rest:
+        a, b = rest.split("-", 1)
+        a, b = a.strip(), b.strip()
+        return f"{sym}{a}-{sym}{b}" if sym else f"{a}-{b}"
+
+    rest = rest.strip()
+    return f"{sym}{rest}" if sym else rest
+
+
 def get_salary_from_card_only_safe(driver, card_xpath: str):
     """
-    Card text’dan faqat xavfsiz holatda salary olamiz:
-    - valyuta belgisi bo‘lsa
-    - yoki pay/salary konteksti bo‘lsa
+    Card text’dan:
+    - valyuta belgisi bor bo‘lsa -> ok
+    - yoki pay/salary keyword bo‘lsa -> ok
+    aks holda -> None (3D/501 xatolar yo‘q bo‘ladi)
     """
     try:
         card_el = driver.find_element(By.XPATH, card_xpath)
@@ -194,27 +242,21 @@ def get_salary_from_card_only_safe(driver, card_xpath: str):
     if not t:
         return None
 
-    # if any currency sign present -> try normalize
     if any(sym in t for sym in CURRENCY_SIGNS):
-        s = normalize_salary(t)
-        if s:
-            return s
+        return normalize_salary(t)
 
-    # else: only accept if pay/salary/estimated keyword exists
     low = t.lower()
     if any(k in low for k in ["pay", "salary", "estimated", "estimate", "compensation"]):
-        s = normalize_salary(t)
-        if s:
-            return s
+        return normalize_salary(t)
 
     return None
 
 
 def get_salary_from_details(driver, old_norm: str, timeout_sec: int = 4):
     """
-    Details panel’dan salary olish, stale bo‘lmasligi uchun kutadi.
+    Details salary elementlaridan oladi.
+    Old salary bilan bir xil bo‘lib qolmasligi uchun ozgina kutadi.
     """
-    start = time.time()
     xps = [
         "//div[contains(@id,'job-salary')]",
         "//*[@data-test='detailSalary']",
@@ -222,6 +264,7 @@ def get_salary_from_details(driver, old_norm: str, timeout_sec: int = 4):
         "//div[contains(@data-test,'detailSalary')]",
         "//span[contains(@data-test,'detailSalary')]",
     ]
+    start = time.time()
 
     while time.time() - start < timeout_sec:
         for xp in xps:
@@ -469,10 +512,13 @@ class GlassdoorScraper:
         except:
             title = ""
 
-        # ✅ salary: first from card (SAFE), else from details with wait
-        salary = get_salary_from_card_only_safe(self.driver, base)
-        if not salary:
-            salary = get_salary_from_details(self.driver, old_salary_norm, timeout_sec=4)
+        # ✅ salary: first from card (safe), else from details
+        salary_norm = get_salary_from_card_only_safe(self.driver, base)
+        if not salary_norm:
+            salary_norm = get_salary_from_details(self.driver, old_salary_norm, timeout_sec=4)
+
+        # ✅ add symbol display
+        salary = salary_norm_to_display(salary_norm)
 
         # skills
         try:
