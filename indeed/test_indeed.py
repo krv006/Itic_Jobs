@@ -63,11 +63,11 @@ def _env_required(key: str) -> str:
 # =========================================================
 def open_db():
     conn = psycopg2.connect(
-        host=_env_required("PG_HOST"),
-        port=_env_required("PG_PORT"),
-        dbname=_env_required("PG_DB"),
-        user=_env_required("PG_USER"),
-        password=_env_required("PG_PASSWORD"),
+        host=_env_required("DB_HOST"),
+        port=_env_required("DB_PORT"),
+        dbname=_env_required("DB_NAME"),
+        user=_env_required("DB_USER"),
+        password=_env_required("DB_PASSWORD"),
     )
     conn.autocommit = False
     create_table_if_not_exists(conn)
