@@ -1,3 +1,7 @@
+# =========================
+# INDEED SCRAPER (FULL FINAL)
+# =========================
+
 import json
 import os
 import re
@@ -11,256 +15,60 @@ import psycopg2
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
 from psycopg2 import Error
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+
+
+# =========================
+# INIT
+# =========================
 
 load_dotenv()
 
 INDEED_HOME = "https://www.indeed.com/"
 DEFAULT_WAIT = 15
 
+
 COUNTRY_CODE_MAP = {
-    "UK": "GB",
-    "Japan": "JP",
-    "Germany": "DE",
-    "Poland": "PL",
-    "France": "FR",
-    "Switzerland": "CH",
-    "London": "GB",
-    "Philippines": "PH",
-    "United States": "US",
-    "China": "CN",
-    "Dubai": "AE",
-    "Abu Dhabi": "AE",
-    "Uzbekistan": "UZ",
-    "Kazakhstan": "KZ",
+    "UK": "GBR",
+    "London": "GBR",
+    "Japan": "JPN",
+    "Germany": "DEU",
+    "Poland": "POL",
+    "France": "FRA",
+    "Switzerland": "CHE",
+    "Philippines": "PHL",
+    "United States": "USA",
+    "China": "CHN",
+    "Dubai": "ARE",
+    "Abu Dhabi": "ARE",
+    "Uzbekistan": "UZB",
+    "Kazakhstan": "KAZ",
 }
 
-# =========================
-# TEXT / SALARY HELPERS
-# =========================
 
-SALARY_RE = re.compile(
-    r"(?P<cur>[$£€])\s?(?P<a>\d{1,3}(?:,\d{3})*(?:\.\d+)?)"
-    r"(?:\s*(?:-|—|to)\s*(?P<cur2>[$£€])?\s?(?P<b>\d{1,3}(?:,\d{3})*(?:\.\d+)?))?"
-    r"(?:\s*(?:an?\s*)?(?P<period>hour|hr|day|week|month|year))?",
-    re.IGNORECASE,
-)
-
+# =========================
+# HELPERS
+# =========================
 
 def clean_text(s: str) -> str:
     if not s:
         return ""
     s = unescape(s)
-    s = s.replace("\u00a0", " ")  # &nbsp;
+    s = s.replace("\u00a0", " ")
     s = re.sub(r"[ \t]+", " ", s)
     return s.strip()
 
 
-def extract_salary_from_text(text: str) -> str:
-    """
-    Panel ichidan faqat salary patternni chiqarib beradi:
-      "$75 - $85 an hour"
-      "$75—$85 USD"
-      "£45,000 a year"
-    """
-    text = clean_text(text)
-    if not text:
+def get_text_safe(el):
+    try:
+        return clean_text(el.text or "")
+    except:
         return ""
 
-    m = SALARY_RE.search(text)
-    if not m:
-        return ""
-
-    cur = m.group("cur")
-    a = m.group("a")
-    b = m.group("b")
-    period = (m.group("period") or "").lower().strip()
-
-    if b:
-        out = f"{cur}{a} - {cur}{b}"
-    else:
-        out = f"{cur}{a}"
-
-    if period:
-        if period == "hr":
-            period = "hour"
-        if period == "hour":
-            out += " an hour"
-        else:
-            out += f" a {period}"
-
-    # Optional: USD/GBP/EUR
-    tail = text[m.end(): m.end() + 25].upper()
-    if "USD" in tail:
-        out += " USD"
-    elif "GBP" in tail:
-        out += " GBP"
-    elif "EUR" in tail:
-        out += " EUR"
-
-    return out.strip()
-
-
-def is_probably_big_description(txt: str) -> bool:
-    """Salary qidirayotganda butun description tushib qolmasin."""
-    if not txt:
-        return False
-    t = txt.lower()
-    if len(txt) > 160:
-        return True
-    # job descriptionga xos so'zlar
-    bad = ["full job description", "essential duties", "responsibilities", "education/experience"]
-    return any(x in t for x in bad)
-
-
-# =========================
-# DRIVER / WAIT
-# =========================
-
-def create_driver(headless: bool = False):
-    options = uc.ChromeOptions()
-    if headless:
-        options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--start-maximized")
-    options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
-    driver = uc.Chrome(options=options, use_subprocess=True)
-    driver.set_page_load_timeout(60)
-    return driver
-
-
-def wait(driver, t=DEFAULT_WAIT):
-    return WebDriverWait(driver, t)
-
-
-# =========================
-# ENV / DB
-# =========================
-
-def _env_required(key: str) -> str:
-    val = os.getenv(key)
-    if not val:
-        raise RuntimeError(f".env da {key} topilmadi!")
-    return val
-
-
-def open_db():
-    db_url = os.getenv("DATABASE_URL", "").strip()
-    if db_url:
-        conn = psycopg2.connect(db_url)
-    else:
-        host = _env_required("DB_HOST")
-        port = _env_required("DB_PORT")
-        dbname = _env_required("DB_NAME")
-        user = _env_required("DB_USER")
-        password = _env_required("DB_PASSWORD")
-        conn = psycopg2.connect(host=host, port=int(port), dbname=dbname, user=user, password=password)
-    conn.autocommit = False
-    return conn
-
-
-def ensure_indeed_table(conn):
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT to_regclass('public.indeed');")
-        result = cur.fetchone()
-        if result[0] is None:
-            create_sql = """
-            CREATE TABLE indeed (
-                id BIGSERIAL PRIMARY KEY,
-                job_id VARCHAR(100) NOT NULL,
-                source VARCHAR(50) NOT NULL,
-                job_title TEXT,
-                company_name TEXT,
-                location TEXT,
-                salary TEXT,
-                job_type TEXT,
-                skills TEXT,
-                education TEXT,
-                job_url TEXT,
-                country TEXT,
-                country_code VARCHAR(2),
-                posted_date DATE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                CONSTRAINT ux_indeed_jobid_source UNIQUE (job_id, source)
-            );
-            """
-            cur.execute(create_sql)
-            conn.commit()
-            print("Jadval 'indeed' yangi yaratildi.")
-        else:
-            cur.execute("""
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='indeed' AND column_name='posted_date';
-            """)
-            if not cur.fetchone():
-                cur.execute("ALTER TABLE indeed ADD COLUMN posted_date DATE;")
-                conn.commit()
-                print("Jadvalga 'posted_date' (DATE) ustuni qo'shildi.")
-            print("Jadval 'indeed' mavjud va tayyor.")
-    except Error as e:
-        conn.rollback()
-        print(f"Jadval tekshirish/yaratishda xato: {e}")
-        traceback.print_exc()
-    finally:
-        cur.close()
-
-
-def save_to_database(
-        conn,
-        job_id,
-        job_title,
-        location,
-        skills,
-        salary,
-        education,
-        job_type,
-        company_name,
-        job_url,
-        country,
-        country_code,
-        posted_date=None,
-        source="indeed.com",
-):
-    sql = """
-    INSERT INTO indeed (
-        job_id, source, job_title, company_name, location,
-        salary, job_type, skills, education, job_url, country, country_code, posted_date
-    )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (job_id, source) DO NOTHING;
-    """
-    try:
-        cur = conn.cursor()
-        cur.execute(sql, (
-            job_id, source, job_title, company_name, location,
-            salary, job_type, skills, education, job_url, country, country_code, posted_date
-        ))
-        inserted = cur.rowcount == 1
-        conn.commit()
-        if inserted:
-            print(
-                f"  ✅ Saqlandi: {job_title[:60]} | {country} ({country_code}) | Posted: {posted_date} | Salary: {salary}")
-        return inserted
-    except Exception as e:
-        conn.rollback()
-        print(f"[DB ERROR] {job_id} → {e}")
-        return False
-
-
-# =========================
-# DOM HELPERS
-# =========================
 
 def safe_click(driver, element):
     try:
@@ -275,37 +83,19 @@ def safe_click(driver, element):
             return False
 
 
-def get_text_safe(el):
-    try:
-        return clean_text(el.text or "")
-    except:
-        return ""
+def wait(driver, t=DEFAULT_WAIT):
+    return WebDriverWait(driver, t)
 
 
-def first_existing(driver_or_el, selectors, timeout=4):
-    t_end = time.time() + timeout
-    while time.time() < t_end:
-        for by, sel in selectors:
-            try:
-                els = driver_or_el.find_elements(by, sel)
-                if els:
-                    return els[0]
-            except:
-                pass
-        time.sleep(0.2)
-    return None
-
-
-def normalize_job_url(href: str) -> str:
+def normalize_job_url(href):
     if not href:
         return ""
-    href = href.strip()
     if href.startswith("/"):
         return "https://www.indeed.com" + href
     return href
 
 
-def get_job_id_from_url(url: str) -> str:
+def get_job_id_from_url(url):
     if "vjk=" in url:
         return url.split("vjk=")[-1].split("&")[0]
     if "jk=" in url:
@@ -314,421 +104,366 @@ def get_job_id_from_url(url: str) -> str:
 
 
 # =========================
-# POSTED DATE PARSER (FIXED)
+# SALARY
 # =========================
 
-def parse_posted_date(raw_text: str) -> str | None:
-    raw = clean_text((raw_text or "").lower())
-    if not raw:
+SALARY_RE = re.compile(
+    r"([$£€])\s?(\d[\d,]*)(?:\s*[-–to]+\s*([$£€])?\s?(\d[\d,]*))?(?:.*?(hour|day|week|month|year|hr))?",
+    re.I
+)
+
+
+def extract_salary(txt):
+    txt = clean_text(txt)
+    if len(txt) > 160:
+        return ""
+
+    m = SALARY_RE.search(txt)
+    if not m:
+        return ""
+
+    cur = m.group(1)
+    a = m.group(2)
+    b = m.group(4)
+    period = m.group(5)
+
+    out = f"{cur}{a}"
+
+    if b:
+        out += f" - {cur}{b}"
+
+    if period:
+        if period == "hr":
+            period = "hour"
+        out += f" / {period}"
+
+    return out
+
+
+# =========================
+# POSTED DATE
+# =========================
+
+def parse_posted_date(txt):
+    txt = clean_text((txt or "").lower())
+
+    if not txt:
         return None
 
-    # normalize Indeed variants
-    raw = raw.replace("posted", "").strip()
-    raw = raw.replace("employeractive", "active")
-    raw = raw.replace("employer active", "active")
-
-    if "just posted" in raw:
-        return datetime.now().strftime("%Y-%m-%d")
-    if "today" in raw:
+    if "today" in txt or "just posted" in txt:
         return datetime.now().strftime("%Y-%m-%d")
 
-    # "30+ days ago"
-    m_plus = re.search(r"(\d+)\+\s*days\s*ago", raw)
-    if m_plus:
-        num = int(m_plus.group(1))
-        dt = datetime.now() - timedelta(days=num)
-        return dt.strftime("%Y-%m-%d")
-
-    # "2 days ago", "3 hours ago", "active 2 days ago"
-    m = re.search(r"(\d+)\s*(day|days|hour|hours)\s*ago", raw)
+    m = re.search(r"(\d+)\s*(day|hour)", txt)
     if m:
         num = int(m.group(1))
         unit = m.group(2)
-        if "day" in unit:
+
+        if unit == "day":
             dt = datetime.now() - timedelta(days=num)
         else:
             dt = datetime.now() - timedelta(hours=num)
+
         return dt.strftime("%Y-%m-%d")
 
-    # Date formats "Jan 12", "Jan 12, 2025"
-    formats = ["%b %d", "%b %d, %Y", "%B %d, %Y"]
-    current_year = datetime.now().year
-    for fmt in formats:
+    return None
+
+
+def extract_posted_from_jsonld(driver):
+    try:
+        scripts = driver.find_elements(By.CSS_SELECTOR, "script[type='application/ld+json']")
+    except:
+        return None
+
+    for sc in scripts:
         try:
-            dt = datetime.strptime(raw.title(), fmt)
-            if dt.year == 1900:
-                dt = dt.replace(year=current_year)
-            return dt.strftime("%Y-%m-%d")
+            data = json.loads(sc.get_attribute("innerText"))
+
+            if isinstance(data, dict):
+                dp = data.get("datePosted")
+                if dp:
+                    return dp[:10]
+
         except:
-            pass
+            continue
 
     return None
 
 
 # =========================
-# LOGIN (Google)
+# DRIVER
 # =========================
 
-def login_google(driver) -> bool:
-    print("Indeed ga Google orqali kirish...")
+def create_driver():
+    options = uc.ChromeOptions()
+
+    options.add_argument("--start-maximized")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+
+    driver = uc.Chrome(options=options)
+    driver.set_page_load_timeout(60)
+
+    return driver
+
+
+# =========================
+# DB
+# =========================
+
+def env(key):
+    v = os.getenv(key)
+    if not v:
+        raise RuntimeError(f".env da {key} yo'q")
+    return v
+
+
+def open_db():
+    return psycopg2.connect(
+        host=env("DB_HOST"),
+        port=env("DB_PORT"),
+        dbname=env("DB_NAME"),
+        user=env("DB_USER"),
+        password=env("DB_PASSWORD"),
+    )
+
+
+def ensure_table(conn):
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS indeed (
+        id BIGSERIAL PRIMARY KEY,
+        job_id VARCHAR(100),
+        source VARCHAR(50),
+        search_query TEXT,
+        job_title TEXT,
+        company_name TEXT,
+        location TEXT,
+        salary TEXT,
+        job_type TEXT,
+        skills TEXT,
+        education TEXT,
+        job_url TEXT,
+        country TEXT,
+        country_code VARCHAR(3),
+        posted_date DATE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(job_id, source)
+    );
+    """)
+
+    conn.commit()
+    cur.close()
+
+    print("✅ DB ready")
+
+
+def save_db(conn, data: dict):
+
+    sql = """
+    INSERT INTO indeed (
+        job_id, source, search_query,
+        job_title, company_name, location,
+        salary, job_type, skills, education,
+        job_url, country, country_code, posted_date
+    )
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    ON CONFLICT (job_id, source) DO NOTHING;
+    """
+
+    cur = conn.cursor()
 
     try:
-        wait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    except TimeoutException:
-        print("Sahifa yuklanmadi (timeout).")
-        return False
+        cur.execute(sql, (
+            data["job_id"],
+            "indeed.com",
+            data["query"],
 
-    try:
-        sign_in = wait(driver, 20).until(
-            EC.element_to_be_clickable(
-                (By.XPATH, "//a[contains(., 'Sign in') or contains(., 'Sign In') or contains(., 'Log in')]"))
-        )
-        safe_click(driver, sign_in)
-        time.sleep(3)
-    except TimeoutException:
-        print("Sign in tugmasi topilmadi.")
-        return False
+            data["title"],
+            data["company"],
+            data["location"],
 
-    try:
-        google_btn = wait(driver, 20).until(EC.element_to_be_clickable((By.ID, "login-google-button")))
-        safe_click(driver, google_btn)
-        time.sleep(3)
-    except TimeoutException:
-        print("Google tugmasi topilmadi.")
-        return False
+            data["salary"],
+            data["job_type"],
+            data["skills"],
+            data["education"],
 
-    opened = False
-    for attempt in range(3):
-        try:
-            wait(driver, 15).until(lambda d: len(d.window_handles) > 1)
-            driver.switch_to.window(driver.window_handles[-1])
-            print(f"Google oynasiga o'tildi (urinish {attempt + 1}).")
-            opened = True
-            break
-        except TimeoutException:
-            print(f"Google oynasi ochilmadi (urinish {attempt + 1}).")
-            time.sleep(2)
+            data["url"],
+            data["country"],
+            data["code"],
+            data["posted"],
+        ))
 
-    if not opened:
-        print("Google login oynasiga o'tish muvaffaqiyatsiz.")
-        return False
+        conn.commit()
 
-    email = _env_required("EMAIL")
-    password = _env_required("EMAIL_PASSWORD")
+        print(f"✅ Saved: {data['title'][:50]} | {data['query']}")
 
-    try:
-        email_inp = wait(driver, 30).until(
-            EC.visibility_of_element_located((By.XPATH, "//input[@type='email' or @name='identifier']"))
-        )
-        email_inp.clear()
-        email_inp.send_keys(email)
-        email_inp.send_keys(Keys.ENTER)
-        time.sleep(4)
-
-        pwd_inp = wait(driver, 30).until(
-            EC.visibility_of_element_located((By.XPATH, "//input[@type='password']"))
-        )
-        pwd_inp.clear()
-        pwd_inp.send_keys(password)
-        pwd_inp.send_keys(Keys.ENTER)
-        time.sleep(7)
-
-        driver.switch_to.window(driver.window_handles[0])
-        time.sleep(4)
-        print("Login muvaffaqiyatli.")
         return True
+
     except Exception as e:
-        print(f"Login jarayonida xato: {e}")
-        traceback.print_exc()
+
+        conn.rollback()
+        print("DB ERROR:", e)
+
         return False
 
+    finally:
+        cur.close()
+
 
 # =========================
-# READ JOB DETAILS (FIXED)
+# LOGIN
 # =========================
 
-def read_job_details_from_right_panel(driver):
-    # Right panel wrapper
-    panel = driver
-    for sel in ["#jobsearch-ViewjobPaneWrapper", "div.jobsearch-RightPane", "div.jobsearch-JobComponent"]:
-        try:
-            panel = driver.find_element(By.CSS_SELECTOR, sel)
-            break
-        except:
-            pass
+def login_google(driver):
 
-    # -------- Company
-    company = ""
+    print("🔐 Google login...")
+
+    driver.get(INDEED_HOME)
+    time.sleep(3)
+
     try:
-        company_el = first_existing(panel, [(By.CSS_SELECTOR, "[data-testid='inlineHeader-companyName']")], timeout=2)
-        if company_el:
-            company = get_text_safe(company_el)
-    except:
-        pass
-
-    # -------- Location
-    location = ""
-    try:
-        loc_el = first_existing(panel, [(By.CSS_SELECTOR, "[data-testid='inlineHeader-companyLocation']")], timeout=2)
-        if loc_el:
-            location = get_text_safe(loc_el)
-    except:
-        pass
-
-    # -------- Job type
-    job_type = ""
-    try:
-        jt_el = first_existing(panel, [(By.XPATH, ".//*[contains(@aria-label, 'Job type')]")], timeout=2)
-        if jt_el:
-            raw = get_text_safe(jt_el)
-            job_type = raw.replace("Job type", "").strip()
-    except:
-        pass
-
-    # -------- Skills (optional)
-    skills = ""
-    try:
-        more_btn = first_existing(panel,
-                                  [(By.XPATH, ".//button[contains(., 'show more') or contains(., '+ show more')]")],
-                                  timeout=1)
-        if more_btn:
-            safe_click(driver, more_btn)
-            time.sleep(0.5)
-
-        sk_el = first_existing(panel, [(By.CSS_SELECTOR, "[aria-label*='Skills'] ul, ul.js-match-insights-provider")],
-                               timeout=2)
-        if sk_el:
-            raw = get_text_safe(sk_el)
-            raw = raw.replace("Skills", "").replace("+ show more", "").replace("- show less", "").replace("(Required)",
-                                                                                                          "")
-            parts = [p.strip() for p in raw.split("\n") if p.strip() and "Do you have" not in p]
-            skills = ", ".join(parts)
-    except:
-        pass
-
-    # -------- Education (default)
-    education = "No Degree Required"
-    try:
-        ed_el = first_existing(panel, [(By.CSS_SELECTOR, "[aria-label*='Education']")], timeout=2)
-        if ed_el:
-            raw = get_text_safe(ed_el).replace("Education", "").replace("(Required)", "")
-            parts = [p.strip() for p in raw.split("\n") if p.strip() and "Do you have" not in p]
-            if parts:
-                education = ", ".join(parts)
-    except:
-        pass
-
-    # -------- Posted date (panel)
-    posted_date = None
-    try:
-        # Indeed footer/metainfo turlicha bo‘ladi
-        posted_el = first_existing(
-            panel,
-            [
-                (By.XPATH,
-                 ".//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'just posted')]"),
-                (By.XPATH,
-                 ".//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'today')]"),
-                (By.XPATH,
-                 ".//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'days ago')]"),
-                (By.XPATH,
-                 ".//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'active')]"),
-                (By.CSS_SELECTOR, "div.jobsearch-JobMetadataFooter"),
-                (By.CSS_SELECTOR, "div.jobsearch-JobMetadataFooter div"),
-            ],
-            timeout=2,
+        btn = wait(driver, 15).until(
+            EC.element_to_be_clickable((By.XPATH, "//a[contains(.,'Sign in')]"))
         )
-        if posted_el:
-            posted_date = parse_posted_date(get_text_safe(posted_el))
+        btn.click()
+        time.sleep(3)
     except:
-        pass
-
-    # -------- SALARY (main FIX)
-    salary = ""
-    try:
-        candidates = []
-
-        # 1) Pay/Salary aria-label elementlar
-        pay_els = panel.find_elements(
-            By.XPATH,
-            ".//*[@aria-label and (contains(translate(@aria-label,'PAYSLARY','payslary'),'pay') "
-            "or contains(translate(@aria-label,'PAYSLARY','payslary'),'salary'))]"
-        )
-        for el in pay_els[:10]:
-            txt = get_text_safe(el)
-            if txt:
-                candidates.append(txt)
-
-        # 2) currency belgisi bor kichik elementlar (uzun bo‘lsa tashlaymiz)
-        cur_els = panel.find_elements(By.XPATH, ".//*[contains(., '$') or contains(., '£') or contains(., '€')]")
-        for el in cur_els[:40]:
-            txt = get_text_safe(el)
-            if not txt:
-                continue
-            if is_probably_big_description(txt):
-                continue
-            candidates.append(txt)
-
-        # 3) candidates ichidan regex bilan salary topish
-        for c in candidates:
-            s = extract_salary_from_text(c)
-            if s:
-                salary = s
-                break
-
-        # 4) oxirgi fallback: panel matnidan regex
-        if not salary:
-            salary = extract_salary_from_text(get_text_safe(panel))
-
-        # final sanitize
-        salary = clean_text(salary)
-
-    except:
-        salary = ""
-
-    return company, location, salary, job_type, skills, education, posted_date
-
-
-# =========================
-# PAGINATION
-# =========================
-
-def click_next_or_stop(driver) -> bool:
-    selectors = [
-        (By.CSS_SELECTOR, "[data-testid='pagination-page-next']"),
-        (By.CSS_SELECTOR, "a[aria-label*='Next']"),
-        (By.XPATH, "//a[contains(@aria-label,'Next')]"),
-    ]
-    el = None
-    for by, sel in selectors:
-        try:
-            el = wait(driver, 8).until(EC.element_to_be_clickable((by, sel)))
-            break
-        except:
-            pass
-    if not el:
         return False
-    return safe_click(driver, el)
+
+    try:
+        gbtn = wait(driver, 10).until(
+            EC.element_to_be_clickable((By.ID, "login-google-button"))
+        )
+        gbtn.click()
+        time.sleep(4)
+    except:
+        return False
+
+    wait(driver, 10).until(lambda d: len(d.window_handles) > 1)
+    driver.switch_to.window(driver.window_handles[-1])
+
+    email = env("EMAIL")
+    pwd = env("EMAIL_PASSWORD")
+
+    wait(driver, 20).until(EC.visibility_of_element_located((By.NAME, "identifier"))).send_keys(email + Keys.ENTER)
+    time.sleep(3)
+
+    wait(driver, 20).until(EC.visibility_of_element_located((By.NAME, "Passwd"))).send_keys(pwd + Keys.ENTER)
+    time.sleep(6)
+
+    driver.switch_to.window(driver.window_handles[0])
+
+    print("✅ Login OK")
+
+    return True
+
+
+# =========================
+# PANEL PARSE
+# =========================
+
+def read_panel(driver):
+
+    panel = driver.find_element(By.ID, "jobsearch-ViewjobPaneWrapper")
+
+    company = get_text_safe(
+        panel.find_element(By.CSS_SELECTOR, "[data-testid='inlineHeader-companyName']")
+    )
+
+    location = get_text_safe(
+        panel.find_element(By.CSS_SELECTOR, "[data-testid='inlineHeader-companyLocation']")
+    )
+
+    salary = extract_salary(panel.text)
+
+    posted = extract_posted_from_jsonld(driver) or parse_posted_date(panel.text)
+
+    return company, location, salary, posted
 
 
 # =========================
 # SCRAPER
 # =========================
 
-def scrape_keyword_country(driver, conn, keyword: str, country_name: str, country_code: str = "", max_pages: int = 5):
+def scrape(driver, conn, keyword, country, code):
+
     q = urllib.parse.quote_plus(keyword)
-    l = urllib.parse.quote_plus(country_name)
-    base_url = f"https://www.indeed.com/jobs?q={q}&l={l}&sort=date"
+    l = urllib.parse.quote_plus(country)
 
-    print(f"\n[SEARCH] {keyword} | {country_name} ({country_code}) → {base_url}")
+    url = f"https://www.indeed.com/jobs?q={q}&l={l}&sort=date"
 
-    driver.get(base_url)
+    print(f"\n🔎 {keyword} | {country}")
+
+    driver.get(url)
     time.sleep(3)
 
-    try:
-        wait(driver, 20).until(
-            EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'mosaic-provider-jobcards')]"))
-        )
-        print("Job list topildi.")
-    except TimeoutException:
-        print("[WARN] Job list topilmadi (CAPTCHA/blok bo‘lishi mumkin).")
-        return
+    wait(driver, 20).until(
+        EC.presence_of_element_located((By.CLASS_NAME, "mosaic-provider-jobcards"))
+    )
 
-    page = 0
-    total_saved = 0
+    pages = 0
 
-    while page < max_pages:
-        page += 1
-        print(f"  [PAGE] {page} | {country_name}")
+    while pages < 5:
 
-        try:
-            container = driver.find_element(By.XPATH, "//div[contains(@class,'mosaic-provider-jobcards')]")
-            job_cards = container.find_elements(By.XPATH, ".//li[.//a[contains(@class,'jcs-JobTitle')]]")
-        except:
-            print("  [STOP] Kartalar topilmadi.")
-            break
+        pages += 1
 
-        if not job_cards:
-            break
+        cards = driver.find_elements(By.CSS_SELECTOR, "a.jcs-JobTitle")
 
-        for card in job_cards:
+        for i in range(len(cards)):
+
             try:
-                title_link = card.find_element(By.XPATH, ".//a[contains(@class,'jcs-JobTitle')]")
-                title = get_text_safe(title_link)
-                if not title:
-                    continue
 
-                # ---- posted date from card (FIXED)
-                posted_date_raw = ""
-                try:
-                    posted_el = card.find_element(
-                        By.XPATH,
-                        ".//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'posted') "
-                        "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'just posted') "
-                        "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'active') "
-                        "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'days ago') "
-                        "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'today')]"
-                    )
-                    posted_date_raw = get_text_safe(posted_el)
-                except:
-                    pass
+                cards = driver.find_elements(By.CSS_SELECTOR, "a.jcs-JobTitle")
+                card = cards[i]
 
-                posted_date = parse_posted_date(posted_date_raw) if posted_date_raw else None
+                title = get_text_safe(card)
 
-                href = normalize_job_url(title_link.get_attribute("href") or "")
+                href = normalize_job_url(card.get_attribute("href"))
+
                 job_id = get_job_id_from_url(href)
+
                 if not job_id:
                     continue
 
-                # Click card
-                safe_click(driver, title_link)
+                safe_click(driver, card)
 
-                # Panel yangilanishini kutamiz (MUHIM)
-                try:
-                    wait(driver, 10).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "#jobsearch-ViewjobPaneWrapper")))
-                except:
-                    pass
-                time.sleep(0.9)
+                time.sleep(1)
 
-                company, location, salary, job_type, skills, education, panel_posted = read_job_details_from_right_panel(
-                    driver)
+                company, location, salary, posted = read_panel(driver)
 
-                # panel_posted topilsa, card posted dan ustun
-                if panel_posted:
-                    posted_date = panel_posted
+                data = {
+                    "job_id": job_id,
+                    "query": keyword,
+                    "title": title,
+                    "company": company,
+                    "location": location,
+                    "salary": salary,
+                    "job_type": "",
+                    "skills": "",
+                    "education": "",
+                    "url": href,
+                    "country": country,
+                    "code": code,
+                    "posted": posted,
+                }
 
-                saved = save_to_database(
-                    conn,
-                    job_id=job_id,
-                    job_title=title,
-                    location=location,
-                    skills=skills,
-                    salary=salary,
-                    education=education,
-                    job_type=job_type,
-                    company_name=company,
-                    job_url=href,
-                    country=country_name,
-                    country_code=country_code,
-                    posted_date=posted_date,
-                    source="indeed.com",
-                )
+                save_db(conn, data)
 
-                if saved:
-                    total_saved += 1
-
-            except Exception as e:
-                print(f"  [CARD ERROR] {e}")
+            except StaleElementReferenceException:
                 continue
 
-        if not click_next_or_stop(driver):
-            print("  [STOP] Keyingi sahifa yo'q.")
+            except Exception as e:
+                print("CARD ERROR:", e)
+
+        # next
+        try:
+            nxt = driver.find_element(By.CSS_SELECTOR, "[aria-label*='Next']")
+            safe_click(driver, nxt)
+            time.sleep(2)
+        except:
             break
-
-        time.sleep(2)
-
-    print(f"[DONE] {keyword} | {country_name} → saved: {total_saved}")
 
 
 # =========================
@@ -736,62 +471,44 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
 # =========================
 
 def main():
-    driver = None
-    conn = None
-    try:
-        driver = create_driver(headless=False)
-        print("Brauzer ochildi.")
 
-        time.sleep(2)
-        driver.get(INDEED_HOME)
-        time.sleep(3)
+    driver = create_driver()
+    conn = open_db()
 
-        if not login_google(driver):
-            print("Login muvaffaqiyatsiz. Dastur to'xtatilmoqda.")
-            return
+    ensure_table(conn)
 
-        conn = open_db()
-        ensure_indeed_table(conn)
+    if not login_google(driver):
+        print("❌ Login failed")
+        return
 
-        with open("jobs-list.json", "r", encoding="utf-8") as f:
-            keywords = json.load(f)
+    with open("jobs-list.json") as f:
+        keywords = json.load(f)
 
-        with open("countries.json", "r", encoding="utf-8") as f:
-            countries = json.load(f)
+    with open("countries.json") as f:
+        countries = json.load(f)
 
-        for keyword in keywords:
-            keyword = str(keyword).strip()
-            if not keyword:
+    for kw in keywords:
+
+        kw = kw.strip()
+        if not kw:
+            continue
+
+        for c in countries:
+
+            c = c.strip()
+            if not c:
                 continue
 
-            for country_name in countries:
-                country_name = str(country_name).strip()
-                if not country_name:
-                    continue
+            code = COUNTRY_CODE_MAP.get(c, "")
 
-                country_code = COUNTRY_CODE_MAP.get(country_name, "")
+            scrape(driver, conn, kw, c, code)
 
-                if not country_code:
-                    print(f"[WARN] {country_name} uchun code topilmadi")
+            time.sleep(5)
 
-                scrape_keyword_country(driver, conn, keyword, country_name, country_code, max_pages=5)
-                time.sleep(8)
+    driver.quit()
+    conn.close()
 
-    except Exception as e:
-        print(f"[MAIN ERROR] {e}")
-        traceback.print_exc()
-    finally:
-        if conn:
-            try:
-                conn.close()
-            except:
-                pass
-        if driver:
-            try:
-                driver.quit()
-            except:
-                print("Brauzer yopilishida xato (zararsiz)")
-        print("Dastur yakunlandi.")
+    print("✅ DONE")
 
 
 if __name__ == "__main__":
