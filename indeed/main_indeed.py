@@ -11,7 +11,7 @@ import psycopg2
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
 from psycopg2 import Error
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -22,25 +22,96 @@ load_dotenv()
 INDEED_HOME = "https://www.indeed.com/"
 DEFAULT_WAIT = 15
 
+# ✅ ISO3 codes (3 harf)
 COUNTRY_CODE_MAP = {
-    "UK": "GB",
-    "Japan": "JP",
-    "Germany": "DE",
-    "Poland": "PL",
-    "France": "FR",
-    "Switzerland": "CH",
-    "London": "GB",
-    "Philippines": "PH",
-    "United States": "US",
-    "China": "CN",
-    "Dubai": "AE",
-    "Abu Dhabi": "AE",
-    "Uzbekistan": "UZ",
-    "Kazakhstan": "KZ",
+    "UK": "GBR",
+    "London": "GBR",
+    "Japan": "JPN",
+    "Germany": "DEU",
+    "Poland": "POL",
+    "France": "FRA",
+    "Switzerland": "CHE",
+    "Philippines": "PHL",
+    "United States": "USA",
+    "China": "CHN",
+    "Dubai": "ARE",  # UAE = ARE (ISO3)
+    "Abu Dhabi": "ARE",
+    "Uzbekistan": "UZB",
+    "Kazakhstan": "KAZ",
 }
 
+
 # =========================
-# TEXT / SALARY HELPERS
+# TEXT HELPERS
+# =========================
+
+def clean_text(s: str) -> str:
+    if not s:
+        return ""
+    s = unescape(s)
+    s = s.replace("\u00a0", " ")
+    s = re.sub(r"[ \t]+", " ", s)
+    return s.strip()
+
+
+def get_text_safe(el) -> str:
+    try:
+        return clean_text(el.text or "")
+    except:
+        return ""
+
+
+def safe_click(driver, element) -> bool:
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+        element.click()
+        return True
+    except:
+        try:
+            driver.execute_script("arguments[0].click();", element)
+            return True
+        except:
+            return False
+
+
+def first_existing(driver_or_el, selectors, timeout=4):
+    t_end = time.time() + timeout
+    while time.time() < t_end:
+        for by, sel in selectors:
+            try:
+                els = driver_or_el.find_elements(by, sel)
+                if els:
+                    return els[0]
+            except:
+                pass
+        time.sleep(0.2)
+    return None
+
+
+def wait(driver, t=DEFAULT_WAIT):
+    return WebDriverWait(driver, t)
+
+
+def normalize_job_url(href: str) -> str:
+    if not href:
+        return ""
+    href = href.strip()
+    if href.startswith("/"):
+        return "https://www.indeed.com" + href
+    return href
+
+
+def get_job_id_from_url(url: str) -> str:
+    # vjk or jk
+    if "vjk=" in url:
+        return url.split("vjk=")[-1].split("&")[0]
+    if "jk=" in url:
+        return url.split("jk=")[-1].split("&")[0]
+    return ""
+
+
+# =========================
+# SALARY EXTRACT (FIXED)
 # =========================
 
 SALARY_RE = re.compile(
@@ -51,26 +122,20 @@ SALARY_RE = re.compile(
 )
 
 
-def clean_text(s: str) -> str:
-    if not s:
-        return ""
-    s = unescape(s)
-    s = s.replace("\u00a0", " ")  # &nbsp;
-    s = re.sub(r"[ \t]+", " ", s)
-    return s.strip()
+def is_probably_big_description(txt: str) -> bool:
+    if not txt:
+        return False
+    t = txt.lower()
+    if len(txt) > 160:
+        return True
+    bad = ["full job description", "essential duties", "responsibilities", "education/experience"]
+    return any(x in t for x in bad)
 
 
 def extract_salary_from_text(text: str) -> str:
-    """
-    Panel ichidan faqat salary patternni chiqarib beradi:
-      "$75 - $85 an hour"
-      "$75—$85 USD"
-      "£45,000 a year"
-    """
     text = clean_text(text)
     if not text:
         return ""
-
     m = SALARY_RE.search(text)
     if not m:
         return ""
@@ -93,7 +158,6 @@ def extract_salary_from_text(text: str) -> str:
         else:
             out += f" a {period}"
 
-    # Optional: USD/GBP/EUR
     tail = text[m.end(): m.end() + 25].upper()
     if "USD" in tail:
         out += " USD"
@@ -105,20 +169,107 @@ def extract_salary_from_text(text: str) -> str:
     return out.strip()
 
 
-def is_probably_big_description(txt: str) -> bool:
-    """Salary qidirayotganda butun description tushib qolmasin."""
-    if not txt:
-        return False
-    t = txt.lower()
-    if len(txt) > 160:
-        return True
-    # job descriptionga xos so'zlar
-    bad = ["full job description", "essential duties", "responsibilities", "education/experience"]
-    return any(x in t for x in bad)
+# =========================
+# POSTED DATE (ULTRA FIX)
+# =========================
+
+def parse_iso_date(s: str) -> str | None:
+    if not s:
+        return None
+    s = str(s).strip()
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", s)
+    return m.group(1) if m else None
+
+
+def parse_posted_date(raw_text: str) -> str | None:
+    raw = clean_text((raw_text or "").lower())
+    if not raw:
+        return None
+
+    raw = raw.replace("posted", "").strip()
+    raw = raw.replace("employeractive", "active")
+    raw = raw.replace("employer active", "active")
+
+    if "just posted" in raw:
+        return datetime.now().strftime("%Y-%m-%d")
+    if "today" in raw:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    m_plus = re.search(r"(\d+)\+\s*days\s*ago", raw)
+    if m_plus:
+        num = int(m_plus.group(1))
+        dt = datetime.now() - timedelta(days=num)
+        return dt.strftime("%Y-%m-%d")
+
+    m = re.search(r"(\d+)\s*(day|days|hour|hours)\s*ago", raw)
+    if m:
+        num = int(m.group(1))
+        unit = m.group(2)
+        if "day" in unit:
+            dt = datetime.now() - timedelta(days=num)
+        else:
+            dt = datetime.now() - timedelta(hours=num)
+        return dt.strftime("%Y-%m-%d")
+
+    formats = ["%b %d", "%b %d, %Y", "%B %d, %Y"]
+    current_year = datetime.now().year
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(raw.title(), fmt)
+            if dt.year == 1900:
+                dt = dt.replace(year=current_year)
+            return dt.strftime("%Y-%m-%d")
+        except:
+            pass
+
+    return None
+
+
+def extract_posted_date_from_jsonld(driver) -> str | None:
+    """
+    Indeed ko'p sahifalarda JSON-LD beradi. Eng stabil: datePosted/datePublished.
+    """
+    try:
+        scripts = driver.find_elements(By.CSS_SELECTOR, "script[type='application/ld+json']")
+    except:
+        scripts = []
+
+    for sc in scripts:
+        try:
+            txt = (sc.get_attribute("innerText") or "").strip()
+            if not txt:
+                continue
+            data = json.loads(txt)
+
+            items = data if isinstance(data, list) else [data]
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+
+                # direct
+                dp = item.get("datePosted") or item.get("datePublished")
+                iso = parse_iso_date(dp) if dp else None
+                if iso:
+                    return iso
+
+                # graph
+                graph = item.get("@graph")
+                if isinstance(graph, list):
+                    for g in graph:
+                        if isinstance(g, dict):
+                            dp2 = g.get("datePosted") or g.get("datePublished")
+                            iso2 = parse_iso_date(dp2) if dp2 else None
+                            if iso2:
+                                return iso2
+        except:
+            continue
+
+    return None
 
 
 # =========================
-# DRIVER / WAIT
+# DRIVER
 # =========================
 
 def create_driver(headless: bool = False):
@@ -138,12 +289,8 @@ def create_driver(headless: bool = False):
     return driver
 
 
-def wait(driver, t=DEFAULT_WAIT):
-    return WebDriverWait(driver, t)
-
-
 # =========================
-# ENV / DB
+# DB
 # =========================
 
 def _env_required(key: str) -> str:
@@ -169,10 +316,16 @@ def open_db():
 
 
 def ensure_indeed_table(conn):
+    """
+    ✅ Table create
+    ✅ posted_date add if missing
+    ✅ country_code always VARCHAR(3) (auto-migrate)
+    """
     cur = conn.cursor()
     try:
         cur.execute("SELECT to_regclass('public.indeed');")
         result = cur.fetchone()
+
         if result[0] is None:
             create_sql = """
             CREATE TABLE indeed (
@@ -188,7 +341,7 @@ def ensure_indeed_table(conn):
                 education TEXT,
                 job_url TEXT,
                 country TEXT,
-                country_code VARCHAR(2),
+                country_code VARCHAR(3),
                 posted_date DATE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 CONSTRAINT ux_indeed_jobid_source UNIQUE (job_id, source)
@@ -196,21 +349,44 @@ def ensure_indeed_table(conn):
             """
             cur.execute(create_sql)
             conn.commit()
-            print("Jadval 'indeed' yangi yaratildi.")
+            print("✅ Jadval 'indeed' yaratildi (country_code=VARCHAR(3)).")
+            return
+
+        # posted_date missing?
+        cur.execute("""
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='indeed' AND column_name='posted_date';
+        """)
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE indeed ADD COLUMN posted_date DATE;")
+            conn.commit()
+            print("✅ 'posted_date' ustuni qo'shildi.")
+
+        # country_code column check
+        cur.execute("""
+            SELECT character_maximum_length
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='indeed' AND column_name='country_code';
+        """)
+        row = cur.fetchone()
+
+        if not row:
+            cur.execute("ALTER TABLE indeed ADD COLUMN country_code VARCHAR(3);")
+            conn.commit()
+            print("✅ 'country_code' ustuni qo'shildi (VARCHAR(3)).")
         else:
-            cur.execute("""
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='indeed' AND column_name='posted_date';
-            """)
-            if not cur.fetchone():
-                cur.execute("ALTER TABLE indeed ADD COLUMN posted_date DATE;")
+            max_len = row[0]
+            if max_len is not None and int(max_len) < 3:
+                cur.execute("ALTER TABLE indeed ALTER COLUMN country_code TYPE VARCHAR(3);")
                 conn.commit()
-                print("Jadvalga 'posted_date' (DATE) ustuni qo'shildi.")
-            print("Jadval 'indeed' mavjud va tayyor.")
+                print("✅ 'country_code' ustuni VARCHAR(3) ga o'zgartirildi.")
+
+        print("✅ Jadval 'indeed' tayyor.")
+
     except Error as e:
         conn.rollback()
-        print(f"Jadval tekshirish/yaratishda xato: {e}")
+        print(f"❌ ensure_indeed_table xato: {e}")
         traceback.print_exc()
     finally:
         cur.close()
@@ -232,6 +408,16 @@ def save_to_database(
         posted_date=None,
         source="indeed.com",
 ):
+    # final sanitize / safety
+    job_id = (job_id or "").strip()
+    if not job_id:
+        return False
+
+    country_code = (country_code or "").strip()
+    if country_code and len(country_code) > 3:
+        country_code = country_code[:3]
+
+    # salary sometimes empty ok
     sql = """
     INSERT INTO indeed (
         job_id, source, job_title, company_name, location,
@@ -259,114 +445,7 @@ def save_to_database(
 
 
 # =========================
-# DOM HELPERS
-# =========================
-
-def safe_click(driver, element):
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
-        element.click()
-        return True
-    except:
-        try:
-            driver.execute_script("arguments[0].click();", element)
-            return True
-        except:
-            return False
-
-
-def get_text_safe(el):
-    try:
-        return clean_text(el.text or "")
-    except:
-        return ""
-
-
-def first_existing(driver_or_el, selectors, timeout=4):
-    t_end = time.time() + timeout
-    while time.time() < t_end:
-        for by, sel in selectors:
-            try:
-                els = driver_or_el.find_elements(by, sel)
-                if els:
-                    return els[0]
-            except:
-                pass
-        time.sleep(0.2)
-    return None
-
-
-def normalize_job_url(href: str) -> str:
-    if not href:
-        return ""
-    href = href.strip()
-    if href.startswith("/"):
-        return "https://www.indeed.com" + href
-    return href
-
-
-def get_job_id_from_url(url: str) -> str:
-    if "vjk=" in url:
-        return url.split("vjk=")[-1].split("&")[0]
-    if "jk=" in url:
-        return url.split("jk=")[-1].split("&")[0]
-    return ""
-
-
-# =========================
-# POSTED DATE PARSER (FIXED)
-# =========================
-
-def parse_posted_date(raw_text: str) -> str | None:
-    raw = clean_text((raw_text or "").lower())
-    if not raw:
-        return None
-
-    # normalize Indeed variants
-    raw = raw.replace("posted", "").strip()
-    raw = raw.replace("employeractive", "active")
-    raw = raw.replace("employer active", "active")
-
-    if "just posted" in raw:
-        return datetime.now().strftime("%Y-%m-%d")
-    if "today" in raw:
-        return datetime.now().strftime("%Y-%m-%d")
-
-    # "30+ days ago"
-    m_plus = re.search(r"(\d+)\+\s*days\s*ago", raw)
-    if m_plus:
-        num = int(m_plus.group(1))
-        dt = datetime.now() - timedelta(days=num)
-        return dt.strftime("%Y-%m-%d")
-
-    # "2 days ago", "3 hours ago", "active 2 days ago"
-    m = re.search(r"(\d+)\s*(day|days|hour|hours)\s*ago", raw)
-    if m:
-        num = int(m.group(1))
-        unit = m.group(2)
-        if "day" in unit:
-            dt = datetime.now() - timedelta(days=num)
-        else:
-            dt = datetime.now() - timedelta(hours=num)
-        return dt.strftime("%Y-%m-%d")
-
-    # Date formats "Jan 12", "Jan 12, 2025"
-    formats = ["%b %d", "%b %d, %Y", "%B %d, %Y"]
-    current_year = datetime.now().year
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(raw.title(), fmt)
-            if dt.year == 1900:
-                dt = dt.replace(year=current_year)
-            return dt.strftime("%Y-%m-%d")
-        except:
-            pass
-
-    return None
-
-
-# =========================
-# LOGIN (Google)
+# LOGIN GOOGLE
 # =========================
 
 def login_google(driver) -> bool:
@@ -381,7 +460,8 @@ def login_google(driver) -> bool:
     try:
         sign_in = wait(driver, 20).until(
             EC.element_to_be_clickable(
-                (By.XPATH, "//a[contains(., 'Sign in') or contains(., 'Sign In') or contains(., 'Log in')]"))
+                (By.XPATH, "//a[contains(., 'Sign in') or contains(., 'Sign In') or contains(., 'Log in')]")
+            )
         )
         safe_click(driver, sign_in)
         time.sleep(3)
@@ -397,20 +477,19 @@ def login_google(driver) -> bool:
         print("Google tugmasi topilmadi.")
         return False
 
+    # popup
     opened = False
     for attempt in range(3):
         try:
             wait(driver, 15).until(lambda d: len(d.window_handles) > 1)
             driver.switch_to.window(driver.window_handles[-1])
-            print(f"Google oynasiga o'tildi (urinish {attempt + 1}).")
             opened = True
             break
         except TimeoutException:
-            print(f"Google oynasi ochilmadi (urinish {attempt + 1}).")
             time.sleep(2)
 
     if not opened:
-        print("Google login oynasiga o'tish muvaffaqiyatsiz.")
+        print("Google oynasi ochilmadi.")
         return False
 
     email = _env_required("EMAIL")
@@ -435,20 +514,20 @@ def login_google(driver) -> bool:
 
         driver.switch_to.window(driver.window_handles[0])
         time.sleep(4)
-        print("Login muvaffaqiyatli.")
+        print("✅ Login muvaffaqiyatli.")
         return True
     except Exception as e:
-        print(f"Login jarayonida xato: {e}")
+        print(f"❌ Login xato: {e}")
         traceback.print_exc()
         return False
 
 
 # =========================
-# READ JOB DETAILS (FIXED)
+# READ DETAILS (SALARY + POSTED FIX)
 # =========================
 
 def read_job_details_from_right_panel(driver):
-    # Right panel wrapper
+    # panel
     panel = driver
     for sel in ["#jobsearch-ViewjobPaneWrapper", "div.jobsearch-RightPane", "div.jobsearch-JobComponent"]:
         try:
@@ -457,7 +536,7 @@ def read_job_details_from_right_panel(driver):
         except:
             pass
 
-    # -------- Company
+    # company
     company = ""
     try:
         company_el = first_existing(panel, [(By.CSS_SELECTOR, "[data-testid='inlineHeader-companyName']")], timeout=2)
@@ -466,7 +545,7 @@ def read_job_details_from_right_panel(driver):
     except:
         pass
 
-    # -------- Location
+    # location
     location = ""
     try:
         loc_el = first_existing(panel, [(By.CSS_SELECTOR, "[data-testid='inlineHeader-companyLocation']")], timeout=2)
@@ -475,17 +554,16 @@ def read_job_details_from_right_panel(driver):
     except:
         pass
 
-    # -------- Job type
+    # job type
     job_type = ""
     try:
         jt_el = first_existing(panel, [(By.XPATH, ".//*[contains(@aria-label, 'Job type')]")], timeout=2)
         if jt_el:
-            raw = get_text_safe(jt_el)
-            job_type = raw.replace("Job type", "").strip()
+            job_type = get_text_safe(jt_el).replace("Job type", "").strip()
     except:
         pass
 
-    # -------- Skills (optional)
+    # skills
     skills = ""
     try:
         more_btn = first_existing(panel,
@@ -506,7 +584,7 @@ def read_job_details_from_right_panel(driver):
     except:
         pass
 
-    # -------- Education (default)
+    # education
     education = "No Degree Required"
     try:
         ed_el = first_existing(panel, [(By.CSS_SELECTOR, "[aria-label*='Education']")], timeout=2)
@@ -518,37 +596,47 @@ def read_job_details_from_right_panel(driver):
     except:
         pass
 
-    # -------- Posted date (panel)
+    # posted date (3-level)
     posted_date = None
-    try:
-        # Indeed footer/metainfo turlicha bo‘ladi
-        posted_el = first_existing(
-            panel,
-            [
-                (By.XPATH,
-                 ".//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'just posted')]"),
-                (By.XPATH,
-                 ".//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'today')]"),
-                (By.XPATH,
-                 ".//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'days ago')]"),
-                (By.XPATH,
-                 ".//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'active')]"),
-                (By.CSS_SELECTOR, "div.jobsearch-JobMetadataFooter"),
-                (By.CSS_SELECTOR, "div.jobsearch-JobMetadataFooter div"),
-            ],
-            timeout=2,
-        )
-        if posted_el:
-            posted_date = parse_posted_date(get_text_safe(posted_el))
-    except:
-        pass
 
-    # -------- SALARY (main FIX)
+    # 1) JSON-LD (best)
+    try:
+        posted_date = extract_posted_date_from_jsonld(driver)
+    except:
+        posted_date = None
+
+    # 2) panel elements text
+    if not posted_date:
+        try:
+            candidates = panel.find_elements(
+                By.XPATH,
+                ".//*[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'just posted') "
+                "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'today') "
+                "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'days ago') "
+                "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'hours ago') "
+                "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'active') "
+                "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'30+')]"
+            )
+            for el in candidates[:30]:
+                d = parse_posted_date(get_text_safe(el))
+                if d:
+                    posted_date = d
+                    break
+        except:
+            pass
+
+    # 3) panel text fallback
+    if not posted_date:
+        try:
+            posted_date = parse_posted_date(get_text_safe(panel))
+        except:
+            pass
+
+    # salary (fixed)
     salary = ""
     try:
         candidates = []
 
-        # 1) Pay/Salary aria-label elementlar
         pay_els = panel.find_elements(
             By.XPATH,
             ".//*[@aria-label and (contains(translate(@aria-label,'PAYSLARY','payslary'),'pay') "
@@ -556,33 +644,29 @@ def read_job_details_from_right_panel(driver):
         )
         for el in pay_els[:10]:
             txt = get_text_safe(el)
-            if txt:
+            if txt and not is_probably_big_description(txt):
                 candidates.append(txt)
 
-        # 2) currency belgisi bor kichik elementlar (uzun bo‘lsa tashlaymiz)
         cur_els = panel.find_elements(By.XPATH, ".//*[contains(., '$') or contains(., '£') or contains(., '€')]")
-        for el in cur_els[:40]:
+        for el in cur_els[:50]:
             txt = get_text_safe(el)
             if not txt:
                 continue
             if is_probably_big_description(txt):
                 continue
+            if len(txt) > 140:
+                continue
             candidates.append(txt)
 
-        # 3) candidates ichidan regex bilan salary topish
         for c in candidates:
             s = extract_salary_from_text(c)
             if s:
                 salary = s
                 break
 
-        # 4) oxirgi fallback: panel matnidan regex
         if not salary:
             salary = extract_salary_from_text(get_text_safe(panel))
-
-        # final sanitize
         salary = clean_text(salary)
-
     except:
         salary = ""
 
@@ -599,16 +683,13 @@ def click_next_or_stop(driver) -> bool:
         (By.CSS_SELECTOR, "a[aria-label*='Next']"),
         (By.XPATH, "//a[contains(@aria-label,'Next')]"),
     ]
-    el = None
     for by, sel in selectors:
         try:
             el = wait(driver, 8).until(EC.element_to_be_clickable((by, sel)))
-            break
+            return safe_click(driver, el)
         except:
             pass
-    if not el:
-        return False
-    return safe_click(driver, el)
+    return False
 
 
 # =========================
@@ -619,7 +700,6 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
     q = urllib.parse.quote_plus(keyword)
     l = urllib.parse.quote_plus(country_name)
     base_url = f"https://www.indeed.com/jobs?q={q}&l={l}&sort=date"
-
     print(f"\n[SEARCH] {keyword} | {country_name} ({country_code}) → {base_url}")
 
     driver.get(base_url)
@@ -651,14 +731,20 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
         if not job_cards:
             break
 
-        for card in job_cards:
+        for idx in range(len(job_cards)):
             try:
+                # re-find to avoid stale
+                container = driver.find_element(By.XPATH, "//div[contains(@class,'mosaic-provider-jobcards')]")
+                job_cards = container.find_elements(By.XPATH, ".//li[.//a[contains(@class,'jcs-JobTitle')]]")
+                if idx >= len(job_cards):
+                    break
+                card = job_cards[idx]
+
                 title_link = card.find_element(By.XPATH, ".//a[contains(@class,'jcs-JobTitle')]")
                 title = get_text_safe(title_link)
                 if not title:
                     continue
 
-                # ---- posted date from card (FIXED)
                 posted_date_raw = ""
                 try:
                     posted_el = card.find_element(
@@ -667,36 +753,37 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
                         "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'just posted') "
                         "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'active') "
                         "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'days ago') "
-                        "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'today')]"
+                        "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'today') "
+                        "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'30+')]"
                     )
                     posted_date_raw = get_text_safe(posted_el)
                 except:
                     pass
 
-                posted_date = parse_posted_date(posted_date_raw) if posted_date_raw else None
+                card_posted = parse_posted_date(posted_date_raw) if posted_date_raw else None
 
                 href = normalize_job_url(title_link.get_attribute("href") or "")
                 job_id = get_job_id_from_url(href)
                 if not job_id:
                     continue
 
-                # Click card
+                # click
                 safe_click(driver, title_link)
 
-                # Panel yangilanishini kutamiz (MUHIM)
+                # wait panel present
                 try:
                     wait(driver, 10).until(
                         EC.presence_of_element_located((By.CSS_SELECTOR, "#jobsearch-ViewjobPaneWrapper")))
                 except:
                     pass
+
+                # small delay for panel update
                 time.sleep(0.9)
 
                 company, location, salary, job_type, skills, education, panel_posted = read_job_details_from_right_panel(
                     driver)
 
-                # panel_posted topilsa, card posted dan ustun
-                if panel_posted:
-                    posted_date = panel_posted
+                posted_date = panel_posted or card_posted
 
                 saved = save_to_database(
                     conn,
@@ -718,6 +805,8 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
                 if saved:
                     total_saved += 1
 
+            except (StaleElementReferenceException,):
+                continue
             except Exception as e:
                 print(f"  [CARD ERROR] {e}")
                 continue
@@ -747,7 +836,7 @@ def main():
         time.sleep(3)
 
         if not login_google(driver):
-            print("Login muvaffaqiyatsiz. Dastur to'xtatilmoqda.")
+            print("Login muvaffaqiyatsiz. Dastur to'xtatildi.")
             return
 
         conn = open_db()
@@ -770,12 +859,18 @@ def main():
                     continue
 
                 country_code = COUNTRY_CODE_MAP.get(country_name, "")
-
                 if not country_code:
-                    print(f"[WARN] {country_name} uchun code topilmadi")
+                    print(f"[WARN] {country_name} uchun ISO3 code topilmadi (country_code empty).")
 
-                scrape_keyword_country(driver, conn, keyword, country_name, country_code, max_pages=5)
-                time.sleep(8)
+                scrape_keyword_country(
+                    driver,
+                    conn,
+                    keyword=keyword,
+                    country_name=country_name,
+                    country_code=country_code,
+                    max_pages=5
+                )
+                time.sleep(6)
 
     except Exception as e:
         print(f"[MAIN ERROR] {e}")
@@ -790,7 +885,7 @@ def main():
             try:
                 driver.quit()
             except:
-                print("Brauzer yopilishida xato (zararsiz)")
+                pass
         print("Dastur yakunlandi.")
 
 
