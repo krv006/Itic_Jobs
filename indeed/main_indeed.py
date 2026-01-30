@@ -1,9 +1,9 @@
 # main_indeed.py
 # ✅ Chrome 144 + undetected_chromedriver
-# ✅ Cloudflare "Verify you are human" chiqsa: KOD KUTADI, siz qo'lda verify qilasiz, keyin davom etadi
-# ✅ Doimiy profil: cookie saqlanadi (captcha kamroq)
+# ✅ Cloudflare verify: manual qilasiz, kod kutadi
+# ✅ Google popup: "Choose an account" chiqsa ham avtomatik bosadi (EMAIL bo‘yicha)
 # ✅ DB: public.indeed table auto-create/migrate
-# ⚠️ Eslatma: Cloudflare'ni "bypass" qilmaymiz. Faqat detect + manual verify uchun wait qilamiz.
+# ✅ search_query (keyword) DB ga yoziladi
 
 import json
 import os
@@ -39,7 +39,6 @@ load_dotenv()
 INDEED_HOME = "https://www.indeed.com/"
 DEFAULT_WAIT = 15
 
-# ✅ ISO3 codes (3 harf)
 COUNTRY_CODE_MAP = {
     "UK": "GBR",
     "London": "GBR",
@@ -57,8 +56,9 @@ COUNTRY_CODE_MAP = {
     "Kazakhstan": "KAZ",
 }
 
+
 # =========================
-# HELPERS
+# BASIC HELPERS
 # =========================
 def wait(driver, t=DEFAULT_WAIT):
     return WebDriverWait(driver, t)
@@ -130,13 +130,12 @@ def get_job_id_from_url(url: str) -> str:
 
 
 # =========================
-# CLOUDFLARE DETECT + WAIT (MANUAL VERIFY)
+# CLOUDFLARE DETECT + WAIT (MANUAL)
 # =========================
 def is_cloudflare_verification(driver) -> bool:
     try:
         title = (driver.title or "").lower()
         src = (driver.page_source or "").lower()
-
         if "additional verification required" in src:
             return True
         if "verify you are human" in src:
@@ -156,15 +155,12 @@ def wait_for_human_verification(driver, timeout=240) -> bool:
     while time.time() - start < timeout:
         if not is_cloudflare_verification(driver):
             return True
-
         if not warned:
             print("\n🛑 Cloudflare verification chiqdi.")
             print("👉 Brauzerda 'Verify you are human' ni qo'lda bajaring.")
             print("👉 Verify bo‘lgandan keyin kod avtomatik davom etadi.\n")
             warned = True
-
         time.sleep(3)
-
     return False
 
 
@@ -172,12 +168,6 @@ def wait_for_human_verification(driver, timeout=240) -> bool:
 # DRIVER
 # =========================
 def create_driver(headless: bool = False):
-    """
-    ✅ Chrome 144 uchun stabil
-    ✅ Doimiy profil: cookie saqlanadi
-    ✅ Profil lock bo‘lsa fallback profil
-    ✅ version_main=144 (Chrome 144 bo‘lgani uchun)
-    """
     options = uc.ChromeOptions()
     if headless:
         options.add_argument("--headless=new")
@@ -234,6 +224,89 @@ def safe_get(driver, url, recreate_driver_fn):
 
 
 # =========================
+# GOOGLE "CHOOSE ACCOUNT" HANDLERS
+# =========================
+def click_if_exists(driver, xpath, timeout=3):
+    try:
+        el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.XPATH, xpath)))
+        safe_click(driver, el)
+        return True
+    except:
+        return False
+
+
+def handle_google_account_chooser(driver, preferred_email: str) -> bool:
+    """
+    Google 'Choose an account' chiqsa:
+    - preferred_email mos bo‘lsa o‘shani bosadi
+    - topilmasa birinchi account tile ni bosadi
+    - bo‘lmasa 'Use another account' ni bosadi
+    """
+    try:
+        src = (driver.page_source or "").lower()
+        if "choose an account" not in src:
+            return False
+    except:
+        return False
+
+    # preferred email
+    if preferred_email:
+        xp = f"//div[@role='link' or @role='button'][.//*[contains(text(), '{preferred_email}')]]"
+        if click_if_exists(driver, xp, timeout=4):
+            time.sleep(1.2)
+            return True
+
+    # first clickable tile (ko‘p holatda account shu)
+    if click_if_exists(driver, "(//div[@role='link' or @role='button'])[1]", timeout=3):
+        time.sleep(1.2)
+        return True
+
+    # Use another account
+    if click_if_exists(driver, "//*[contains(., 'Use another account')]", timeout=3):
+        time.sleep(1.2)
+        return True
+
+    return False
+
+
+def google_login_flow(driver, email: str, password: str) -> bool:
+    # chooser bo‘lsa handle
+    handle_google_account_chooser(driver, email)
+
+    # email step (agar chiqsa)
+    try:
+        email_inp = WebDriverWait(driver, 6).until(
+            EC.visibility_of_element_located((By.XPATH, "//input[@type='email' or @name='identifier']"))
+        )
+        email_inp.clear()
+        email_inp.send_keys(email)
+        email_inp.send_keys(Keys.ENTER)
+        time.sleep(2.5)
+    except:
+        pass
+
+    # password step (agar chiqsa)
+    try:
+        pwd_inp = WebDriverWait(driver, 12).until(
+            EC.visibility_of_element_located((By.XPATH, "//input[@type='password']"))
+        )
+        pwd_inp.clear()
+        pwd_inp.send_keys(password)
+        pwd_inp.send_keys(Keys.ENTER)
+        time.sleep(4.5)
+    except:
+        pass
+
+    # Consent/Continue bo‘lishi mumkin
+    click_if_exists(driver, "//button[.//*[contains(., 'Continue')]]", timeout=2)
+    click_if_exists(driver, "//button[.//*[contains(., 'Allow')]]", timeout=2)
+    click_if_exists(driver, "//button[contains(., 'Continue')]", timeout=2)
+    click_if_exists(driver, "//button[contains(., 'Allow')]", timeout=2)
+
+    return True
+
+
+# =========================
 # SALARY EXTRACT
 # =========================
 SALARY_RE = re.compile(
@@ -267,10 +340,7 @@ def extract_salary_from_text(text: str) -> str:
     b = m.group("b")
     period = (m.group("period") or "").lower().strip()
 
-    if b:
-        out = f"{cur}{a} - {cur}{b}"
-    else:
-        out = f"{cur}{a}"
+    out = f"{cur}{a} - {cur}{b}" if b else f"{cur}{a}"
 
     if period:
         if period == "hr":
@@ -324,10 +394,7 @@ def parse_posted_date(raw_text: str):
     if m:
         num = int(m.group(1))
         unit = m.group(2)
-        if "day" in unit:
-            dt = datetime.now() - timedelta(days=num)
-        else:
-            dt = datetime.now() - timedelta(hours=num)
+        dt = datetime.now() - (timedelta(days=num) if "day" in unit else timedelta(hours=num))
         return dt.strftime("%Y-%m-%d")
 
     formats = ["%b %d", "%b %d, %Y", "%B %d, %Y"]
@@ -426,6 +493,7 @@ def ensure_indeed_table(conn):
                 skills TEXT,
                 education TEXT,
                 job_url TEXT,
+                search_query TEXT,
                 country TEXT,
                 country_code VARCHAR(3),
                 posted_date DATE,
@@ -435,12 +503,12 @@ def ensure_indeed_table(conn):
             """
             cur.execute(create_sql)
             conn.commit()
-            print("✅ Jadval 'indeed' yaratildi (country_code=VARCHAR(3)).")
+            print("✅ Jadval 'indeed' yaratildi (search_query bor).")
             return
 
+        # posted_date
         cur.execute("""
-            SELECT 1
-            FROM information_schema.columns
+            SELECT 1 FROM information_schema.columns
             WHERE table_schema='public' AND table_name='indeed' AND column_name='posted_date';
         """)
         if not cur.fetchone():
@@ -448,6 +516,17 @@ def ensure_indeed_table(conn):
             conn.commit()
             print("✅ 'posted_date' ustuni qo'shildi.")
 
+        # search_query
+        cur.execute("""
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='indeed' AND column_name='search_query';
+        """)
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE indeed ADD COLUMN search_query TEXT;")
+            conn.commit()
+            print("✅ 'search_query' ustuni qo'shildi.")
+
+        # country_code length
         cur.execute("""
             SELECT character_maximum_length
             FROM information_schema.columns
@@ -466,7 +545,6 @@ def ensure_indeed_table(conn):
                 print("✅ 'country_code' ustuni VARCHAR(3) ga o'zgartirildi.")
 
         print("✅ Jadval 'indeed' tayyor.")
-
     except Error as e:
         conn.rollback()
         print(f"❌ ensure_indeed_table xato: {e}")
@@ -489,6 +567,7 @@ def save_to_database(
     country,
     country_code,
     posted_date=None,
+    search_query="",
     source="indeed.com",
 ):
     job_id = (job_id or "").strip()
@@ -502,35 +581,23 @@ def save_to_database(
     sql = """
     INSERT INTO indeed (
         job_id, source, job_title, company_name, location,
-        salary, job_type, skills, education, job_url, country, country_code, posted_date
+        salary, job_type, skills, education, job_url,
+        search_query, country, country_code, posted_date
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (job_id, source) DO NOTHING;
     """
     try:
         cur = conn.cursor()
-        cur.execute(
-            sql,
-            (
-                job_id,
-                source,
-                job_title,
-                company_name,
-                location,
-                salary,
-                job_type,
-                skills,
-                education,
-                job_url,
-                country,
-                country_code,
-                posted_date,
-            ),
-        )
+        cur.execute(sql, (
+            job_id, source, job_title, company_name, location,
+            salary, job_type, skills, education, job_url,
+            search_query, country, country_code, posted_date
+        ))
         inserted = cur.rowcount == 1
         conn.commit()
         if inserted:
-            print(f"  ✅ Saqlandi: {str(job_title)[:60]} | {country} ({country_code}) | Posted: {posted_date} | Salary: {salary}")
+            print(f"  ✅ Saqlandi: [{search_query}] {str(job_title)[:55]} | {country} ({country_code}) | Posted: {posted_date} | Salary: {salary}")
         return inserted
     except Exception as e:
         conn.rollback()
@@ -539,7 +606,7 @@ def save_to_database(
 
 
 # =========================
-# LOGIN GOOGLE (MANUAL VERIFY SUPPORTED)
+# LOGIN GOOGLE (CHOOSER + CLOUDFLARE)
 # =========================
 def login_google(driver) -> bool:
     print("Indeed ga Google orqali kirish...")
@@ -554,6 +621,7 @@ def login_google(driver) -> bool:
         print("Sahifa yuklanmadi (timeout).")
         return False
 
+    # Sign in
     try:
         sign_in = wait(driver, 20).until(
             EC.element_to_be_clickable(
@@ -570,6 +638,7 @@ def login_google(driver) -> bool:
         if not wait_for_human_verification(driver, timeout=240):
             return False
 
+    # Google button
     try:
         google_btn = wait(driver, 20).until(EC.element_to_be_clickable((By.ID, "login-google-button")))
         safe_click(driver, google_btn)
@@ -580,7 +649,7 @@ def login_google(driver) -> bool:
 
     # popup
     opened = False
-    for _ in range(6):
+    for _ in range(10):
         try:
             wait(driver, 10).until(lambda d: len(d.window_handles) > 1)
             driver.switch_to.window(driver.window_handles[-1])
@@ -597,21 +666,9 @@ def login_google(driver) -> bool:
     password = _env_required("EMAIL_PASSWORD")
 
     try:
-        email_inp = wait(driver, 30).until(
-            EC.visibility_of_element_located((By.XPATH, "//input[@type='email' or @name='identifier']"))
-        )
-        email_inp.clear()
-        email_inp.send_keys(email)
-        email_inp.send_keys(Keys.ENTER)
-        time.sleep(3)
+        google_login_flow(driver, email, password)
 
-        pwd_inp = wait(driver, 30).until(EC.visibility_of_element_located((By.XPATH, "//input[@type='password']")))
-        pwd_inp.clear()
-        pwd_inp.send_keys(password)
-        pwd_inp.send_keys(Keys.ENTER)
-        time.sleep(5)
-
-        # back to indeed tab
+        # back to main
         driver.switch_to.window(driver.window_handles[0])
         time.sleep(3)
 
@@ -619,7 +676,7 @@ def login_google(driver) -> bool:
             if not wait_for_human_verification(driver, timeout=240):
                 return False
 
-        print("✅ Login muvaffaqiyatli (yoki sessiya tayyor).")
+        print("✅ Google login bosqichi yakunlandi.")
         return True
     except Exception as e:
         print(f"❌ Login xato: {e}")
@@ -665,24 +722,15 @@ def read_job_details_from_right_panel(driver):
 
     skills = ""
     try:
-        more_btn = first_existing(
-            panel, [(By.XPATH, ".//button[contains(., 'show more') or contains(., '+ show more')]")], timeout=1
-        )
+        more_btn = first_existing(panel, [(By.XPATH, ".//button[contains(., 'show more') or contains(., '+ show more')]")], timeout=1)
         if more_btn:
             safe_click(driver, more_btn)
             time.sleep(0.4)
 
-        sk_el = first_existing(
-            panel, [(By.CSS_SELECTOR, "[aria-label*='Skills'] ul, ul.js-match-insights-provider")], timeout=2
-        )
+        sk_el = first_existing(panel, [(By.CSS_SELECTOR, "[aria-label*='Skills'] ul, ul.js-match-insights-provider")], timeout=2)
         if sk_el:
             raw = get_text_safe(sk_el)
-            raw = (
-                raw.replace("Skills", "")
-                .replace("+ show more", "")
-                .replace("- show less", "")
-                .replace("(Required)", "")
-            )
+            raw = raw.replace("Skills", "").replace("+ show more", "").replace("- show less", "").replace("(Required)", "")
             parts = [p.strip() for p in raw.split("\n") if p.strip() and "Do you have" not in p]
             skills = ", ".join(parts)
     except:
@@ -700,7 +748,6 @@ def read_job_details_from_right_panel(driver):
         pass
 
     posted_date = None
-
     try:
         posted_date = extract_posted_date_from_jsonld(driver)
     except:
@@ -715,7 +762,7 @@ def read_job_details_from_right_panel(driver):
                 "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'days ago') "
                 "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'hours ago') "
                 "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'active') "
-                "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'30+')]",
+                "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'30+')]"
             )
             for el in candidates[:30]:
                 d = parse_posted_date(get_text_safe(el))
@@ -738,7 +785,7 @@ def read_job_details_from_right_panel(driver):
         pay_els = panel.find_elements(
             By.XPATH,
             ".//*[@aria-label and (contains(translate(@aria-label,'PAYSLARY','payslary'),'pay') "
-            "or contains(translate(@aria-label,'PAYSLARY','payslary'),'salary'))]",
+            "or contains(translate(@aria-label,'PAYSLARY','payslary'),'salary'))]"
         )
         for el in pay_els[:10]:
             txt = get_text_safe(el)
@@ -796,7 +843,7 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
     q = urllib.parse.quote_plus(keyword)
     l = urllib.parse.quote_plus(country_name)
     base_url = f"https://www.indeed.com/jobs?q={q}&l={l}&sort=date"
-    print(f"\n[SEARCH] {keyword} | {country_name} ({country_code}) → {base_url}")
+    print(f"\n[SEARCH] keyword='{keyword}' | country='{country_name}' ({country_code}) → {base_url}")
 
     driver.get(base_url)
     time.sleep(2)
@@ -819,7 +866,7 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
 
     while page < max_pages:
         page += 1
-        print(f"  [PAGE] {page} | {country_name}")
+        print(f"  [PAGE] {page} | {country_name} | keyword='{keyword}'")
 
         if is_cloudflare_verification(driver):
             if not wait_for_human_verification(driver, timeout=240):
@@ -842,8 +889,8 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
                 job_cards = container.find_elements(By.XPATH, ".//li[.//a[contains(@class,'jcs-JobTitle')]]")
                 if idx >= len(job_cards):
                     break
-                card = job_cards[idx]
 
+                card = job_cards[idx]
                 title_link = card.find_element(By.XPATH, ".//a[contains(@class,'jcs-JobTitle')]")
                 title = get_text_safe(title_link)
                 if not title:
@@ -858,7 +905,7 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
                         "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'active') "
                         "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'days ago') "
                         "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'today') "
-                        "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'30+')]",
+                        "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'30+')]"
                     )
                     posted_date_raw = get_text_safe(posted_el)
                 except:
@@ -880,9 +927,7 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
                         continue
 
                 try:
-                    wait(driver, 12).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "#jobsearch-ViewjobPaneWrapper"))
-                    )
+                    wait(driver, 12).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#jobsearch-ViewjobPaneWrapper")))
                 except:
                     pass
 
@@ -903,6 +948,7 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
                     country=country_name,
                     country_code=country_code,
                     posted_date=posted_date,
+                    search_query=keyword,  # ✅ keyword DB ga yoziladi
                     source="indeed.com",
                 )
                 if saved:
@@ -922,7 +968,7 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
 
         time.sleep(2)
 
-    print(f"[DONE] {keyword} | {country_name} → saved: {total_saved}")
+    print(f"[DONE] keyword='{keyword}' | {country_name} → saved: {total_saved}")
 
 
 # =========================
@@ -943,7 +989,7 @@ def main():
             return
 
         if not login_google(driver):
-            print("Login muvaffaqiyatsiz. Dastur to'xtatildi.")
+            print("❌ Login muvaffaqiyatsiz. Dastur to'xtatildi.")
             return
 
         conn = open_db()
@@ -978,7 +1024,7 @@ def main():
                     max_pages=5,
                 )
 
-                # ✅ anti-botga kamroq tushish uchun pause
+                # anti-botga kamroq tushish uchun pause
                 time.sleep(8)
 
     except Exception as e:
