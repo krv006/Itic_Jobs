@@ -350,7 +350,7 @@ def extract_salary_from_text(text: str) -> str:
         else:
             out += f" a {period}"
 
-    tail = text[m.end() : m.end() + 25].upper()
+    tail = text[m.end(): m.end() + 25].upper()
     if "USD" in tail:
         out += " USD"
     elif "GBP" in tail:
@@ -554,21 +554,21 @@ def ensure_indeed_table(conn):
 
 
 def save_to_database(
-    conn,
-    job_id,
-    job_title,
-    location,
-    skills,
-    salary,
-    education,
-    job_type,
-    company_name,
-    job_url,
-    country,
-    country_code,
-    posted_date=None,
-    search_query="",
-    source="indeed.com",
+        conn,
+        job_id,
+        job_title,
+        location,
+        skills,
+        salary,
+        education,
+        job_type,
+        company_name,
+        job_url,
+        country,
+        country_code,
+        posted_date=None,
+        search_query="",
+        source="indeed.com",
 ):
     job_id = (job_id or "").strip()
     if not job_id:
@@ -597,7 +597,8 @@ def save_to_database(
         inserted = cur.rowcount == 1
         conn.commit()
         if inserted:
-            print(f"  ✅ Saqlandi: [{search_query}] {str(job_title)[:55]} | {country} ({country_code}) | Posted: {posted_date} | Salary: {salary}")
+            print(
+                f"  ✅ Saqlandi: [{search_query}] {str(job_title)[:55]} | {country} ({country_code}) | Posted: {posted_date} | Salary: {salary}")
         return inserted
     except Exception as e:
         conn.rollback()
@@ -722,15 +723,19 @@ def read_job_details_from_right_panel(driver):
 
     skills = ""
     try:
-        more_btn = first_existing(panel, [(By.XPATH, ".//button[contains(., 'show more') or contains(., '+ show more')]")], timeout=1)
+        more_btn = first_existing(panel,
+                                  [(By.XPATH, ".//button[contains(., 'show more') or contains(., '+ show more')]")],
+                                  timeout=1)
         if more_btn:
             safe_click(driver, more_btn)
             time.sleep(0.4)
 
-        sk_el = first_existing(panel, [(By.CSS_SELECTOR, "[aria-label*='Skills'] ul, ul.js-match-insights-provider")], timeout=2)
+        sk_el = first_existing(panel, [(By.CSS_SELECTOR, "[aria-label*='Skills'] ul, ul.js-match-insights-provider")],
+                               timeout=2)
         if sk_el:
             raw = get_text_safe(sk_el)
-            raw = raw.replace("Skills", "").replace("+ show more", "").replace("- show less", "").replace("(Required)", "")
+            raw = raw.replace("Skills", "").replace("+ show more", "").replace("- show less", "").replace("(Required)",
+                                                                                                          "")
             parts = [p.strip() for p in raw.split("\n") if p.strip() and "Do you have" not in p]
             skills = ", ".join(parts)
     except:
@@ -927,11 +932,13 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
                         continue
 
                 try:
-                    wait(driver, 12).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#jobsearch-ViewjobPaneWrapper")))
+                    wait(driver, 12).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "#jobsearch-ViewjobPaneWrapper")))
                 except:
                     pass
 
-                company, location, salary, job_type, skills, education, panel_posted = read_job_details_from_right_panel(driver)
+                company, location, salary, job_type, skills, education, panel_posted = read_job_details_from_right_panel(
+                    driver)
                 posted_date = panel_posted or card_posted
 
                 saved = save_to_database(
