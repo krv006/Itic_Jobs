@@ -1,3 +1,10 @@
+# main_indeed.py
+# ✅ Chrome 144 + undetected_chromedriver
+# ✅ Cloudflare "Verify you are human" chiqsa: KOD KUTADI, siz qo'lda verify qilasiz, keyin davom etadi
+# ✅ Doimiy profil: cookie saqlanadi (captcha kamroq)
+# ✅ DB: public.indeed table auto-create/migrate
+# ⚠️ Eslatma: Cloudflare'ni "bypass" qilmaymiz. Faqat detect + manual verify uchun wait qilamiz.
+
 import json
 import os
 import re
@@ -6,17 +13,27 @@ import traceback
 import urllib.parse
 from datetime import datetime, timedelta
 from html import unescape
+from pathlib import Path
 
 import psycopg2
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
 from psycopg2 import Error
-from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
+from selenium.common.exceptions import (
+    TimeoutException,
+    StaleElementReferenceException,
+    NoSuchWindowException,
+    WebDriverException,
+    SessionNotCreatedException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+# =========================
+# ENV
+# =========================
 load_dotenv()
 
 INDEED_HOME = "https://www.indeed.com/"
@@ -34,16 +51,23 @@ COUNTRY_CODE_MAP = {
     "Philippines": "PHL",
     "United States": "USA",
     "China": "CHN",
-    "Dubai": "ARE",  # UAE = ARE (ISO3)
+    "Dubai": "ARE",
     "Abu Dhabi": "ARE",
     "Uzbekistan": "UZB",
     "Kazakhstan": "KAZ",
 }
 
+# =========================
+# HELPERS
+# =========================
+def wait(driver, t=DEFAULT_WAIT):
+    return WebDriverWait(driver, t)
 
-# =========================
-# TEXT HELPERS
-# =========================
+
+def _ensure_dir(p: str) -> str:
+    Path(p).mkdir(parents=True, exist_ok=True)
+    return p
+
 
 def clean_text(s: str) -> str:
     if not s:
@@ -88,10 +112,6 @@ def first_existing(driver_or_el, selectors, timeout=4):
     return None
 
 
-def wait(driver, t=DEFAULT_WAIT):
-    return WebDriverWait(driver, t)
-
-
 def normalize_job_url(href: str) -> str:
     if not href:
         return ""
@@ -102,7 +122,6 @@ def normalize_job_url(href: str) -> str:
 
 
 def get_job_id_from_url(url: str) -> str:
-    # vjk or jk
     if "vjk=" in url:
         return url.split("vjk=")[-1].split("&")[0]
     if "jk=" in url:
@@ -111,9 +130,112 @@ def get_job_id_from_url(url: str) -> str:
 
 
 # =========================
-# SALARY EXTRACT (FIXED)
+# CLOUDFLARE DETECT + WAIT (MANUAL VERIFY)
 # =========================
+def is_cloudflare_verification(driver) -> bool:
+    try:
+        title = (driver.title or "").lower()
+        src = (driver.page_source or "").lower()
 
+        if "additional verification required" in src:
+            return True
+        if "verify you are human" in src:
+            return True
+        if "cloudflare" in src and ("verify" in src or "cf-ray" in src):
+            return True
+        if "just a moment" in title:
+            return True
+        return False
+    except:
+        return False
+
+
+def wait_for_human_verification(driver, timeout=240) -> bool:
+    start = time.time()
+    warned = False
+    while time.time() - start < timeout:
+        if not is_cloudflare_verification(driver):
+            return True
+
+        if not warned:
+            print("\n🛑 Cloudflare verification chiqdi.")
+            print("👉 Brauzerda 'Verify you are human' ni qo'lda bajaring.")
+            print("👉 Verify bo‘lgandan keyin kod avtomatik davom etadi.\n")
+            warned = True
+
+        time.sleep(3)
+
+    return False
+
+
+# =========================
+# DRIVER
+# =========================
+def create_driver(headless: bool = False):
+    """
+    ✅ Chrome 144 uchun stabil
+    ✅ Doimiy profil: cookie saqlanadi
+    ✅ Profil lock bo‘lsa fallback profil
+    ✅ version_main=144 (Chrome 144 bo‘lgani uchun)
+    """
+    options = uc.ChromeOptions()
+    if headless:
+        options.add_argument("--headless=new")
+
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--start-maximized")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--remote-allow-origins=*")
+
+    base_profiles = _ensure_dir(os.path.join(os.getcwd(), "_chrome_profiles"))
+    profile_dir = os.path.join(base_profiles, "indeed_profile")
+    options.add_argument(f"--user-data-dir={profile_dir}")
+
+    try:
+        driver = uc.Chrome(options=options, version_main=144, use_subprocess=True)
+        driver.set_page_load_timeout(60)
+        return driver
+    except (SessionNotCreatedException, WebDriverException, Exception) as e:
+        print(f"[DRIVER WARN] Primary profile/driver ishlamadi: {e}")
+
+        fallback_dir = os.path.join(base_profiles, f"indeed_profile_fallback_{int(time.time())}")
+        options2 = uc.ChromeOptions()
+        if headless:
+            options2.add_argument("--headless=new")
+
+        options2.add_argument("--no-sandbox")
+        options2.add_argument("--disable-dev-shm-usage")
+        options2.add_argument("--disable-gpu")
+        options2.add_argument("--start-maximized")
+        options2.add_argument("--disable-blink-features=AutomationControlled")
+        options2.add_argument("--remote-allow-origins=*")
+        options2.add_argument(f"--user-data-dir={fallback_dir}")
+
+        driver = uc.Chrome(options=options2, version_main=144, use_subprocess=True)
+        driver.set_page_load_timeout(60)
+        return driver
+
+
+def safe_get(driver, url, recreate_driver_fn):
+    try:
+        driver.get(url)
+        return driver
+    except (NoSuchWindowException, WebDriverException):
+        try:
+            driver.quit()
+        except:
+            pass
+        time.sleep(1)
+        driver = recreate_driver_fn()
+        driver.get(url)
+        return driver
+
+
+# =========================
+# SALARY EXTRACT
+# =========================
 SALARY_RE = re.compile(
     r"(?P<cur>[$£€])\s?(?P<a>\d{1,3}(?:,\d{3})*(?:\.\d+)?)"
     r"(?:\s*(?:-|—|to)\s*(?P<cur2>[$£€])?\s?(?P<b>\d{1,3}(?:,\d{3})*(?:\.\d+)?))?"
@@ -158,7 +280,7 @@ def extract_salary_from_text(text: str) -> str:
         else:
             out += f" a {period}"
 
-    tail = text[m.end(): m.end() + 25].upper()
+    tail = text[m.end() : m.end() + 25].upper()
     if "USD" in tail:
         out += " USD"
     elif "GBP" in tail:
@@ -170,10 +292,9 @@ def extract_salary_from_text(text: str) -> str:
 
 
 # =========================
-# POSTED DATE (ULTRA FIX)
+# POSTED DATE
 # =========================
-
-def parse_iso_date(s: str) -> str | None:
+def parse_iso_date(s: str):
     if not s:
         return None
     s = str(s).strip()
@@ -181,7 +302,7 @@ def parse_iso_date(s: str) -> str | None:
     return m.group(1) if m else None
 
 
-def parse_posted_date(raw_text: str) -> str | None:
+def parse_posted_date(raw_text: str):
     raw = clean_text((raw_text or "").lower())
     if not raw:
         return None
@@ -190,9 +311,7 @@ def parse_posted_date(raw_text: str) -> str | None:
     raw = raw.replace("employeractive", "active")
     raw = raw.replace("employer active", "active")
 
-    if "just posted" in raw:
-        return datetime.now().strftime("%Y-%m-%d")
-    if "today" in raw:
+    if "just posted" in raw or "today" in raw:
         return datetime.now().strftime("%Y-%m-%d")
 
     m_plus = re.search(r"(\d+)\+\s*days\s*ago", raw)
@@ -225,10 +344,7 @@ def parse_posted_date(raw_text: str) -> str | None:
     return None
 
 
-def extract_posted_date_from_jsonld(driver) -> str | None:
-    """
-    Indeed ko'p sahifalarda JSON-LD beradi. Eng stabil: datePosted/datePublished.
-    """
+def extract_posted_date_from_jsonld(driver):
     try:
         scripts = driver.find_elements(By.CSS_SELECTOR, "script[type='application/ld+json']")
     except:
@@ -240,20 +356,17 @@ def extract_posted_date_from_jsonld(driver) -> str | None:
             if not txt:
                 continue
             data = json.loads(txt)
-
             items = data if isinstance(data, list) else [data]
 
             for item in items:
                 if not isinstance(item, dict):
                     continue
 
-                # direct
                 dp = item.get("datePosted") or item.get("datePublished")
                 iso = parse_iso_date(dp) if dp else None
                 if iso:
                     return iso
 
-                # graph
                 graph = item.get("@graph")
                 if isinstance(graph, list):
                     for g in graph:
@@ -269,30 +382,8 @@ def extract_posted_date_from_jsonld(driver) -> str | None:
 
 
 # =========================
-# DRIVER
-# =========================
-
-def create_driver(headless: bool = False):
-    options = uc.ChromeOptions()
-    if headless:
-        options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--start-maximized")
-    options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    )
-    driver = uc.Chrome(options=options, use_subprocess=True)
-    driver.set_page_load_timeout(60)
-    return driver
-
-
-# =========================
 # DB
 # =========================
-
 def _env_required(key: str) -> str:
     val = os.getenv(key)
     if not val:
@@ -316,11 +407,6 @@ def open_db():
 
 
 def ensure_indeed_table(conn):
-    """
-    ✅ Table create
-    ✅ posted_date add if missing
-    ✅ country_code always VARCHAR(3) (auto-migrate)
-    """
     cur = conn.cursor()
     try:
         cur.execute("SELECT to_regclass('public.indeed');")
@@ -352,7 +438,6 @@ def ensure_indeed_table(conn):
             print("✅ Jadval 'indeed' yaratildi (country_code=VARCHAR(3)).")
             return
 
-        # posted_date missing?
         cur.execute("""
             SELECT 1
             FROM information_schema.columns
@@ -363,14 +448,12 @@ def ensure_indeed_table(conn):
             conn.commit()
             print("✅ 'posted_date' ustuni qo'shildi.")
 
-        # country_code column check
         cur.execute("""
             SELECT character_maximum_length
             FROM information_schema.columns
             WHERE table_schema='public' AND table_name='indeed' AND column_name='country_code';
         """)
         row = cur.fetchone()
-
         if not row:
             cur.execute("ALTER TABLE indeed ADD COLUMN country_code VARCHAR(3);")
             conn.commit()
@@ -393,22 +476,21 @@ def ensure_indeed_table(conn):
 
 
 def save_to_database(
-        conn,
-        job_id,
-        job_title,
-        location,
-        skills,
-        salary,
-        education,
-        job_type,
-        company_name,
-        job_url,
-        country,
-        country_code,
-        posted_date=None,
-        source="indeed.com",
+    conn,
+    job_id,
+    job_title,
+    location,
+    skills,
+    salary,
+    education,
+    job_type,
+    company_name,
+    job_url,
+    country,
+    country_code,
+    posted_date=None,
+    source="indeed.com",
 ):
-    # final sanitize / safety
     job_id = (job_id or "").strip()
     if not job_id:
         return False
@@ -417,7 +499,6 @@ def save_to_database(
     if country_code and len(country_code) > 3:
         country_code = country_code[:3]
 
-    # salary sometimes empty ok
     sql = """
     INSERT INTO indeed (
         job_id, source, job_title, company_name, location,
@@ -428,15 +509,28 @@ def save_to_database(
     """
     try:
         cur = conn.cursor()
-        cur.execute(sql, (
-            job_id, source, job_title, company_name, location,
-            salary, job_type, skills, education, job_url, country, country_code, posted_date
-        ))
+        cur.execute(
+            sql,
+            (
+                job_id,
+                source,
+                job_title,
+                company_name,
+                location,
+                salary,
+                job_type,
+                skills,
+                education,
+                job_url,
+                country,
+                country_code,
+                posted_date,
+            ),
+        )
         inserted = cur.rowcount == 1
         conn.commit()
         if inserted:
-            print(
-                f"  ✅ Saqlandi: {job_title[:60]} | {country} ({country_code}) | Posted: {posted_date} | Salary: {salary}")
+            print(f"  ✅ Saqlandi: {str(job_title)[:60]} | {country} ({country_code}) | Posted: {posted_date} | Salary: {salary}")
         return inserted
     except Exception as e:
         conn.rollback()
@@ -445,11 +539,14 @@ def save_to_database(
 
 
 # =========================
-# LOGIN GOOGLE
+# LOGIN GOOGLE (MANUAL VERIFY SUPPORTED)
 # =========================
-
 def login_google(driver) -> bool:
     print("Indeed ga Google orqali kirish...")
+
+    if is_cloudflare_verification(driver):
+        if not wait_for_human_verification(driver, timeout=240):
+            return False
 
     try:
         wait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
@@ -464,29 +561,33 @@ def login_google(driver) -> bool:
             )
         )
         safe_click(driver, sign_in)
-        time.sleep(3)
+        time.sleep(2)
     except TimeoutException:
         print("Sign in tugmasi topilmadi.")
         return False
 
+    if is_cloudflare_verification(driver):
+        if not wait_for_human_verification(driver, timeout=240):
+            return False
+
     try:
         google_btn = wait(driver, 20).until(EC.element_to_be_clickable((By.ID, "login-google-button")))
         safe_click(driver, google_btn)
-        time.sleep(3)
+        time.sleep(2)
     except TimeoutException:
         print("Google tugmasi topilmadi.")
         return False
 
     # popup
     opened = False
-    for attempt in range(3):
+    for _ in range(6):
         try:
-            wait(driver, 15).until(lambda d: len(d.window_handles) > 1)
+            wait(driver, 10).until(lambda d: len(d.window_handles) > 1)
             driver.switch_to.window(driver.window_handles[-1])
             opened = True
             break
         except TimeoutException:
-            time.sleep(2)
+            time.sleep(1)
 
     if not opened:
         print("Google oynasi ochilmadi.")
@@ -502,19 +603,23 @@ def login_google(driver) -> bool:
         email_inp.clear()
         email_inp.send_keys(email)
         email_inp.send_keys(Keys.ENTER)
-        time.sleep(4)
+        time.sleep(3)
 
-        pwd_inp = wait(driver, 30).until(
-            EC.visibility_of_element_located((By.XPATH, "//input[@type='password']"))
-        )
+        pwd_inp = wait(driver, 30).until(EC.visibility_of_element_located((By.XPATH, "//input[@type='password']")))
         pwd_inp.clear()
         pwd_inp.send_keys(password)
         pwd_inp.send_keys(Keys.ENTER)
-        time.sleep(7)
+        time.sleep(5)
 
+        # back to indeed tab
         driver.switch_to.window(driver.window_handles[0])
-        time.sleep(4)
-        print("✅ Login muvaffaqiyatli.")
+        time.sleep(3)
+
+        if is_cloudflare_verification(driver):
+            if not wait_for_human_verification(driver, timeout=240):
+                return False
+
+        print("✅ Login muvaffaqiyatli (yoki sessiya tayyor).")
         return True
     except Exception as e:
         print(f"❌ Login xato: {e}")
@@ -523,11 +628,9 @@ def login_google(driver) -> bool:
 
 
 # =========================
-# READ DETAILS (SALARY + POSTED FIX)
+# READ DETAILS
 # =========================
-
 def read_job_details_from_right_panel(driver):
-    # panel
     panel = driver
     for sel in ["#jobsearch-ViewjobPaneWrapper", "div.jobsearch-RightPane", "div.jobsearch-JobComponent"]:
         try:
@@ -536,7 +639,6 @@ def read_job_details_from_right_panel(driver):
         except:
             pass
 
-    # company
     company = ""
     try:
         company_el = first_existing(panel, [(By.CSS_SELECTOR, "[data-testid='inlineHeader-companyName']")], timeout=2)
@@ -545,7 +647,6 @@ def read_job_details_from_right_panel(driver):
     except:
         pass
 
-    # location
     location = ""
     try:
         loc_el = first_existing(panel, [(By.CSS_SELECTOR, "[data-testid='inlineHeader-companyLocation']")], timeout=2)
@@ -554,7 +655,6 @@ def read_job_details_from_right_panel(driver):
     except:
         pass
 
-    # job type
     job_type = ""
     try:
         jt_el = first_existing(panel, [(By.XPATH, ".//*[contains(@aria-label, 'Job type')]")], timeout=2)
@@ -563,28 +663,31 @@ def read_job_details_from_right_panel(driver):
     except:
         pass
 
-    # skills
     skills = ""
     try:
-        more_btn = first_existing(panel,
-                                  [(By.XPATH, ".//button[contains(., 'show more') or contains(., '+ show more')]")],
-                                  timeout=1)
+        more_btn = first_existing(
+            panel, [(By.XPATH, ".//button[contains(., 'show more') or contains(., '+ show more')]")], timeout=1
+        )
         if more_btn:
             safe_click(driver, more_btn)
-            time.sleep(0.5)
+            time.sleep(0.4)
 
-        sk_el = first_existing(panel, [(By.CSS_SELECTOR, "[aria-label*='Skills'] ul, ul.js-match-insights-provider")],
-                               timeout=2)
+        sk_el = first_existing(
+            panel, [(By.CSS_SELECTOR, "[aria-label*='Skills'] ul, ul.js-match-insights-provider")], timeout=2
+        )
         if sk_el:
             raw = get_text_safe(sk_el)
-            raw = raw.replace("Skills", "").replace("+ show more", "").replace("- show less", "").replace("(Required)",
-                                                                                                          "")
+            raw = (
+                raw.replace("Skills", "")
+                .replace("+ show more", "")
+                .replace("- show less", "")
+                .replace("(Required)", "")
+            )
             parts = [p.strip() for p in raw.split("\n") if p.strip() and "Do you have" not in p]
             skills = ", ".join(parts)
     except:
         pass
 
-    # education
     education = "No Degree Required"
     try:
         ed_el = first_existing(panel, [(By.CSS_SELECTOR, "[aria-label*='Education']")], timeout=2)
@@ -596,16 +699,13 @@ def read_job_details_from_right_panel(driver):
     except:
         pass
 
-    # posted date (3-level)
     posted_date = None
 
-    # 1) JSON-LD (best)
     try:
         posted_date = extract_posted_date_from_jsonld(driver)
     except:
         posted_date = None
 
-    # 2) panel elements text
     if not posted_date:
         try:
             candidates = panel.find_elements(
@@ -615,7 +715,7 @@ def read_job_details_from_right_panel(driver):
                 "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'days ago') "
                 "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'hours ago') "
                 "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'active') "
-                "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'30+')]"
+                "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'30+')]",
             )
             for el in candidates[:30]:
                 d = parse_posted_date(get_text_safe(el))
@@ -625,14 +725,12 @@ def read_job_details_from_right_panel(driver):
         except:
             pass
 
-    # 3) panel text fallback
     if not posted_date:
         try:
             posted_date = parse_posted_date(get_text_safe(panel))
         except:
             pass
 
-    # salary (fixed)
     salary = ""
     try:
         candidates = []
@@ -640,7 +738,7 @@ def read_job_details_from_right_panel(driver):
         pay_els = panel.find_elements(
             By.XPATH,
             ".//*[@aria-label and (contains(translate(@aria-label,'PAYSLARY','payslary'),'pay') "
-            "or contains(translate(@aria-label,'PAYSLARY','payslary'),'salary'))]"
+            "or contains(translate(@aria-label,'PAYSLARY','payslary'),'salary'))]",
         )
         for el in pay_els[:10]:
             txt = get_text_safe(el)
@@ -676,7 +774,6 @@ def read_job_details_from_right_panel(driver):
 # =========================
 # PAGINATION
 # =========================
-
 def click_next_or_stop(driver) -> bool:
     selectors = [
         (By.CSS_SELECTOR, "[data-testid='pagination-page-next']"),
@@ -695,7 +792,6 @@ def click_next_or_stop(driver) -> bool:
 # =========================
 # SCRAPER
 # =========================
-
 def scrape_keyword_country(driver, conn, keyword: str, country_name: str, country_code: str = "", max_pages: int = 5):
     q = urllib.parse.quote_plus(keyword)
     l = urllib.parse.quote_plus(country_name)
@@ -703,10 +799,14 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
     print(f"\n[SEARCH] {keyword} | {country_name} ({country_code}) → {base_url}")
 
     driver.get(base_url)
-    time.sleep(3)
+    time.sleep(2)
+
+    if not wait_for_human_verification(driver, timeout=240):
+        print("[WARN] Cloudflare verification timeout. Bu keyword/country skip.")
+        return
 
     try:
-        wait(driver, 20).until(
+        wait(driver, 25).until(
             EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'mosaic-provider-jobcards')]"))
         )
         print("Job list topildi.")
@@ -721,6 +821,11 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
         page += 1
         print(f"  [PAGE] {page} | {country_name}")
 
+        if is_cloudflare_verification(driver):
+            if not wait_for_human_verification(driver, timeout=240):
+                print("[WARN] Cloudflare verification timeout. Page stop.")
+                break
+
         try:
             container = driver.find_element(By.XPATH, "//div[contains(@class,'mosaic-provider-jobcards')]")
             job_cards = container.find_elements(By.XPATH, ".//li[.//a[contains(@class,'jcs-JobTitle')]]")
@@ -733,7 +838,6 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
 
         for idx in range(len(job_cards)):
             try:
-                # re-find to avoid stale
                 container = driver.find_element(By.XPATH, "//div[contains(@class,'mosaic-provider-jobcards')]")
                 job_cards = container.find_elements(By.XPATH, ".//li[.//a[contains(@class,'jcs-JobTitle')]]")
                 if idx >= len(job_cards):
@@ -754,7 +858,7 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
                         "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'active') "
                         "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'days ago') "
                         "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'today') "
-                        "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'30+')]"
+                        "or contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'30+')]",
                     )
                     posted_date_raw = get_text_safe(posted_el)
                 except:
@@ -767,22 +871,22 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
                 if not job_id:
                     continue
 
-                # click
                 safe_click(driver, title_link)
+                time.sleep(1.0)
 
-                # wait panel present
+                if is_cloudflare_verification(driver):
+                    if not wait_for_human_verification(driver, timeout=240):
+                        print("  [WARN] Cloudflare timeout. Card skip.")
+                        continue
+
                 try:
-                    wait(driver, 10).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "#jobsearch-ViewjobPaneWrapper")))
+                    wait(driver, 12).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "#jobsearch-ViewjobPaneWrapper"))
+                    )
                 except:
                     pass
 
-                # small delay for panel update
-                time.sleep(0.9)
-
-                company, location, salary, job_type, skills, education, panel_posted = read_job_details_from_right_panel(
-                    driver)
-
+                company, location, salary, job_type, skills, education, panel_posted = read_job_details_from_right_panel(driver)
                 posted_date = panel_posted or card_posted
 
                 saved = save_to_database(
@@ -801,11 +905,12 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
                     posted_date=posted_date,
                     source="indeed.com",
                 )
-
                 if saved:
                     total_saved += 1
 
-            except (StaleElementReferenceException,):
+                time.sleep(0.8)
+
+            except StaleElementReferenceException:
                 continue
             except Exception as e:
                 print(f"  [CARD ERROR] {e}")
@@ -823,7 +928,6 @@ def scrape_keyword_country(driver, conn, keyword: str, country_name: str, countr
 # =========================
 # MAIN
 # =========================
-
 def main():
     driver = None
     conn = None
@@ -831,9 +935,12 @@ def main():
         driver = create_driver(headless=False)
         print("Brauzer ochildi.")
 
+        driver = safe_get(driver, INDEED_HOME, lambda: create_driver(headless=False))
         time.sleep(2)
-        driver.get(INDEED_HOME)
-        time.sleep(3)
+
+        if not wait_for_human_verification(driver, timeout=240):
+            print("❌ Cloudflare verification timeout. Dastur to'xtadi.")
+            return
 
         if not login_google(driver):
             print("Login muvaffaqiyatsiz. Dastur to'xtatildi.")
@@ -868,9 +975,11 @@ def main():
                     keyword=keyword,
                     country_name=country_name,
                     country_code=country_code,
-                    max_pages=5
+                    max_pages=5,
                 )
-                time.sleep(6)
+
+                # ✅ anti-botga kamroq tushish uchun pause
+                time.sleep(8)
 
     except Exception as e:
         print(f"[MAIN ERROR] {e}")
