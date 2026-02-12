@@ -1,20 +1,18 @@
-import os
-import json
-import time
 import datetime
 import hashlib
+import json
+import os
 import re
+import time
 from pathlib import Path
 
 import psycopg2
-from dotenv import load_dotenv
-
 import undetected_chromedriver as uc
+from dotenv import load_dotenv
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-
+from selenium.webdriver.support.ui import WebDriverWait
 
 # ================== ENV ==================
 load_dotenv()
@@ -25,13 +23,11 @@ DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
-
 # ================== PATHS ==================
 BASE_DIR = Path(__file__).resolve().parent
 JOBS_PATH = BASE_DIR / "job_list.json"
 COUNTRIES_PATH = BASE_DIR / "countries.json"
 COOKIES_PATH = BASE_DIR / "cookies.json"
-
 
 # ================== COUNTRY -> ISO3 CODE ==================
 COUNTRY_CODE_MAP = {
@@ -50,6 +46,7 @@ COUNTRY_CODE_MAP = {
     "Uzbekistan": "UZB",
     "Kazakhstan": "KAZ",
 }
+
 
 def get_country_code(country: str) -> str:
     return COUNTRY_CODE_MAP.get((country or "").strip(), "UNK")
@@ -74,6 +71,7 @@ CURRENCY_SYMBOL_MAP = {
     "BRL": "R$",
     "UNK": "",
 }
+
 
 def detect_currency(raw: str) -> str:
     if not raw:
@@ -129,6 +127,7 @@ CONTEXT_RANGE_RE = re.compile(
     re.VERBOSE | re.IGNORECASE
 )
 
+
 def to_int(num_str: str, unit: str):
     v = float(num_str.replace(",", ""))
     unit = (unit or "").upper()
@@ -137,6 +136,7 @@ def to_int(num_str: str, unit: str):
     elif unit == "M":
         v *= 1000000
     return int(v)
+
 
 def normalize_salary(raw_text: str):
     """
@@ -500,7 +500,8 @@ class GlassdoorScraper:
         # details
         try:
             company = self.wait1.until(
-                EC.presence_of_element_located((By.XPATH, "//div[contains(@class,'EmployerProfile_employerNameHeading')]"))
+                EC.presence_of_element_located(
+                    (By.XPATH, "//div[contains(@class,'EmployerProfile_employerNameHeading')]"))
             ).text
         except:
             company = ""
@@ -563,7 +564,10 @@ if __name__ == "__main__":
     options = uc.ChromeOptions()
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--start-maximized")
-    driver = uc.Chrome(options=options)
+    driver = uc.Chrome(
+        options=options,
+        version_main=144
+    )
 
     with open(JOBS_PATH, "r", encoding="utf-8") as f:
         jobs = json.load(f)
