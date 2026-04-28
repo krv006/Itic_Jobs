@@ -353,7 +353,7 @@ def create_driver():
     options.add_argument("--disable-gpu")
     options.add_argument("--log-level=3")
     options.page_load_strategy = "eager"
-    return uc.Chrome(options=options)
+    return uc.Chrome(options=options, version_main=147)
 
 
 def safe_quit(driver):
