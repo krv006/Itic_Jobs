@@ -203,7 +203,7 @@ def create_driver(headless: bool = False):
         options2.add_argument("--remote-allow-origins=*")
         options2.add_argument(f"--user-data-dir={fallback_dir}")
 
-        driver = uc.Chrome(options=options2, version_main=144, use_subprocess=True)
+        driver = uc.Chrome(options=options2, version_main=147, use_subprocess=True)
         driver.set_page_load_timeout(60)
         return driver
 
