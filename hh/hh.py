@@ -450,48 +450,46 @@ def create_table_if_not_exists():
     )
 
 def save_to_database(data: dict):
-    cursor.execute(
-        f"""
-        INSERT INTO {TABLE_NAME} (
-            job_id, job_title, location, country, country_code, skills, salary,
-            education, job_type, company_name, job_url,
-            source, posted_date, job_subtitle, search_query
+    try:
+        cursor.execute(
+            f"""
+            INSERT INTO {TABLE_NAME} (
+                job_id, job_title, location, country, country_code, skills, salary,
+                education, job_type, company_name, job_url,
+                source, posted_date, job_subtitle, search_query
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (job_id) DO NOTHING;
+            """,
+            (
+                data["job_id"],
+                data["job_title"],
+                data["location"],
+                data.get("country"),
+                data.get("country_code"),
+                data["skills"],
+                data["salary"],
+                data["education"],
+                data["job_type"],
+                data["company_name"],
+                data["job_url"],
+                data["source"],
+                data["posted_date"],
+                data["job_subtitle"],
+                data["search_query"],
+            ),
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        ON CONFLICT (job_id) DO UPDATE SET
-            job_title    = EXCLUDED.job_title,
-            location     = EXCLUDED.location,
-            country      = COALESCE(EXCLUDED.country, {TABLE_NAME}.country),
-            country_code = COALESCE(EXCLUDED.country_code, {TABLE_NAME}.country_code),
-            skills       = EXCLUDED.skills,
-            salary       = EXCLUDED.salary,
-            education    = EXCLUDED.education,
-            job_type     = EXCLUDED.job_type,
-            company_name = EXCLUDED.company_name,
-            job_url      = EXCLUDED.job_url,
-            source       = EXCLUDED.source,
-            posted_date  = EXCLUDED.posted_date,
-            job_subtitle = EXCLUDED.job_subtitle,
-            search_query = EXCLUDED.search_query;
-        """,
-        (
-            data["job_id"],
-            data["job_title"],
-            data["location"],
-            data.get("country"),
-            data.get("country_code"),
-            data["skills"],
-            data["salary"],
-            data["education"],
-            data["job_type"],
-            data["company_name"],
-            data["job_url"],
-            data["source"],
-            data["posted_date"],
-            data["job_subtitle"],
-            data["search_query"],
-        ),
-    )
+
+        if cursor.rowcount == 1:
+            print(f"✅ SAVED: {data['job_id']}")
+            return True
+        else:
+            print(f"⚠️ DUPLICATE: {data['job_id']}")
+            return False
+
+    except Exception as e:
+        print(f"❌ DB ERROR: {e}")
+        return False
 
 
 # ----------------------------
@@ -506,7 +504,7 @@ def create_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    return uc.Chrome(options=options)
+    return uc.Chrome(options=options, version_main=147)
 
 def safe_text(driver, xpath: str) -> str:
     try:
