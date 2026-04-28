@@ -25,7 +25,7 @@ load_dotenv()
 # CONFIG
 # ----------------------------
 TABLE_NAME = "public.hh"
-DEFAULT_WAIT = 20
+DEFAULT_WAIT = 8
 
 # ----------------------------
 # FALLBACK ENGLISH NORMALIZER (NO API)
@@ -450,7 +450,7 @@ def create_table_if_not_exists():
         """
     )
 
-def save_to_database(data: dict):
+def save_to_database(cursor, data: dict):
     try:
         cursor.execute(
             f"""
@@ -480,13 +480,7 @@ def save_to_database(data: dict):
                 data["search_query"],
             ),
         )
-
-        if cursor.rowcount == 1:
-            print(f"✅ SAVED: {data['job_id']}")
-            return True
-        else:
-            print(f"⚠️ DUPLICATE: {data['job_id']}")
-            return False
+        return cursor.rowcount == 1
 
     except Exception as e:
         print(f"❌ DB ERROR: {e}")
@@ -498,26 +492,42 @@ def save_to_database(data: dict):
 # ----------------------------
 def create_driver():
     options = uc.ChromeOptions()
+
     if os.getenv("HEADLESS", "false").lower() == "true":
         options.add_argument("--headless=new")
 
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")                 # 🔧 qo‘sh
+    options.add_argument("--disable-extensions")          # 🔧 qo‘sh
+    options.add_argument("--disable-infobars")            # 🔧 qo‘sh
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
+
+    # 🔧 page load tezroq va kamroq crash
+    options.page_load_strategy = "eager"
+
+    # 🔧 real user-agent
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+    )
+
     return uc.Chrome(options=options, version_main=147)
 
 
 def safe_text(driver, xpath: str, retries=3) -> str:
     for _ in range(retries):
         try:
-            el = driver.find_element(By.XPATH, xpath)
+            el = WebDriverWait(driver, 3).until(   # 🔧 5 → 3
+                EC.presence_of_element_located((By.XPATH, xpath))
+            )
             return el.text.strip()
-        except StaleElementReferenceException:
-            time.sleep(0.3)
+        except (StaleElementReferenceException, TimeoutException):
+            time.sleep(0.2)   # 🔧 kamaytirildi
         except NoSuchElementException:
             return ""
     return ""
+
 
 # ----------------------------
 # VALIDATION
@@ -615,7 +625,6 @@ def get_hh_posted_date(driver) -> datetime.date:
 # ----------------------------
 def get_search_result_urls(driver, wait) -> List[str]:
     wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[data-qa='serp-item__title']")))
-    time.sleep(0.2)
 
     links = driver.find_elements(By.CSS_SELECTOR, "a[data-qa='serp-item__title']")
     urls = []
@@ -623,22 +632,32 @@ def get_search_result_urls(driver, wait) -> List[str]:
 
     for a in links:
         href = a.get_attribute("href")
-        if not href:
+        if not href or "/vacancy/" not in href:
             continue
-        if "/vacancy/" not in href:
-            continue
-        if href in seen:
-            continue
-        seen.add(href)
-        urls.append(href)
+
+        if href not in seen:
+            seen.add(href)
+            urls.append(href)
 
     return urls
+
 
 
 # ----------------------------
 # SCRAPER
 # ----------------------------
 def get_hh_vacancies(jobs_list):
+
+    conn = psycopg2.connect(
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT"),
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+    )
+    conn.autocommit = True
+    cursor = conn.cursor()
+
     create_table_if_not_exists()
 
     driver = create_driver()
@@ -647,10 +666,12 @@ def get_hh_vacancies(jobs_list):
     try:
         for job in jobs_list:
             page = 0
+
             while True:
                 q = quote_plus(str(job))
-                search_url = f"https://tashkent.hh.uz/search/vacancy?text={q}&page={page}"
-                driver.get(search_url)
+                url = f"https://tashkent.hh.uz/search/vacancy?text={q}&page={page}"
+
+                driver.get(url)
 
                 try:
                     urls = get_search_result_urls(driver, wait)
@@ -660,76 +681,71 @@ def get_hh_vacancies(jobs_list):
                 if not urls:
                     break
 
-                for url in urls:
-                    time.sleep(0.45)
-                    driver.get(url)
+                for vacancy_url in urls:
+                    try:
+                        driver.get(vacancy_url)
 
-                    job_id = url.split("?")[0].split("/")[-1]
-                    if not is_valid_job_id(job_id):
+                        # 🔥 WAIT qo‘shildi (sleep o‘rniga)
+                        wait.until(EC.presence_of_element_located((By.XPATH, "//h1")))
+
+                        job_id = vacancy_url.split("/")[-1].split("?")[0]
+                        if not is_valid_job_id(job_id):
+                            continue
+
+                        raw_title = safe_text(driver, "//h1")
+                        if not is_valid_job_title(raw_title):
+                            continue
+
+                        posted_date = get_hh_posted_date(driver)
+
+                        raw_location = safe_text(driver, "//span[@data-qa='vacancy-view-raw-address']")
+
+                        # 🔥 SKILLS FAST FIX
+                        raw_skills = safe_text(driver, "//ul[contains(@class,'vacancy-skill-list')]").replace("\n", ",")
+
+                        raw_salary = safe_text(driver, "//span[contains(@data-qa,'vacancy-salary')]")
+                        raw_job_type = safe_text(driver, "//div[@data-qa='vacancy-working-hours']")
+                        raw_company = safe_text(driver, "//div[@data-qa='vacancy-company__details']")
+
+                        location = to_english(raw_location)
+
+                        country, country_code = extract_country_name_and_code_from_location(location)
+
+                        data = {
+                            "job_id": job_id,
+                            "job_title": to_english(raw_title),
+                            "location": location,
+                            "country": country,
+                            "country_code": country_code,
+                            "skills": normalize_skills_csv(raw_skills),
+                            "salary": normalize_salary_range(to_english(raw_salary)),
+                            "education": "",
+                            "job_type": to_english(raw_job_type),
+                            "company_name": to_english(raw_company),
+                            "job_url": vacancy_url,
+                            "source": "hh.uz",
+                            "posted_date": posted_date,
+                            "job_subtitle": str(job),
+                            "search_query": extract_search_query_from_url(vacancy_url),
+                        }
+
+                        saved = save_to_database(cursor, data)
+
+                        if saved:
+                            print(f"✅ {job_id} | {country_code}")
+                        else:
+                            print(f"⚠️ DUPLICATE {job_id}")
+
+                    except Exception as e:
+                        print(f"❌ PARSE ERROR: {e}")
                         continue
-
-                    raw_title = safe_text(driver, "//h1")
-                    if not is_valid_job_title(raw_title):
-                        continue
-
-                    posted_date = get_hh_posted_date(driver)
-
-                    raw_location = safe_text(driver, "//span[@data-qa='vacancy-view-raw-address']")
-                    raw_skills = safe_text(driver, "//ul[contains(@class,'vacancy-skill-list')]").replace("\n", ",")
-                    raw_salary = safe_text(driver, "//span[contains(@data-qa,'vacancy-salary')]")
-                    raw_job_type = safe_text(driver, "//div[@data-qa='vacancy-working-hours']")
-                    raw_company = safe_text(driver, "//div[@data-qa='vacancy-company__details']")
-
-                    job_title = to_english(raw_title)
-
-                    # normalize to english first
-                    location = to_english(raw_location)
-                    skills = normalize_skills_csv(raw_skills)
-                    salary = normalize_salary_range(to_english(raw_salary))
-                    job_type = to_english(raw_job_type)
-                    company_name = to_english(raw_company)
-
-                    # ✅ country + code from location
-                    country, country_code = extract_country_name_and_code_from_location(location)
-
-                    search_query = extract_search_query_from_url(url)
-
-                    data = {
-                        "job_id": job_id,
-                        "job_title": job_title,
-                        "location": location,
-                        "country": country,
-                        "country_code": country_code,
-                        "skills": skills,
-                        "salary": salary,
-                        "education": "",
-                        "job_type": job_type,
-                        "company_name": company_name,
-                        "job_url": url,
-                        "source": "hh.uz",
-                        "posted_date": posted_date,
-                        "job_subtitle": str(job),
-                        "search_query": search_query,
-                    }
-
-                    save_to_database(data)
-                    print(f"SAVED: {job_id} | posted_date={posted_date} | country_code={country_code} | q={job}")
 
                 page += 1
 
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-        try:
-            cursor.close()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
+        driver.quit()
+        cursor.close()
+        conn.close()
 
 
 def main():
