@@ -506,12 +506,17 @@ def create_driver():
     options.add_argument("--disable-blink-features=AutomationControlled")
     return uc.Chrome(options=options, version_main=147)
 
-def safe_text(driver, xpath: str) -> str:
-    try:
-        return driver.find_element(By.XPATH, xpath).text.strip()
-    except NoSuchElementException:
-        return ""
 
+def safe_text(driver, xpath: str, retries=3) -> str:
+    for _ in range(retries):
+        try:
+            el = driver.find_element(By.XPATH, xpath)
+            return el.text.strip()
+        except StaleElementReferenceException:
+            time.sleep(0.3)
+        except NoSuchElementException:
+            return ""
+    return ""
 
 # ----------------------------
 # VALIDATION
