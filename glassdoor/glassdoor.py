@@ -564,10 +564,7 @@ if __name__ == "__main__":
     options = uc.ChromeOptions()
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--start-maximized")
-    driver = uc.Chrome(
-        options=options,
-        version_main=144
-    )
+    driver = uc.Chrome(options=options, version_main=147)
 
     with open(JOBS_PATH, "r", encoding="utf-8") as f:
         jobs = json.load(f)
