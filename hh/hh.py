@@ -3,33 +3,47 @@ import json
 import os
 import re
 import time
-from urllib.parse import urlparse, parse_qs, unquote_plus, quote_plus
 from typing import Optional, Tuple, Set, Dict, List
+from urllib.parse import urlparse, parse_qs, unquote_plus, quote_plus
 
+import geonamescache
 import psycopg2
+import pycountry
 import undetected_chromedriver as uc
 from dotenv import load_dotenv
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    TimeoutException,
+    StaleElementReferenceException,
+    NoSuchWindowException,
+    WebDriverException,
+    InvalidSessionIdException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.common.exceptions import StaleElementReferenceException
 
-# ✅ offline country resolver
-import geonamescache
-import pycountry
 
 load_dotenv()
 
-# ----------------------------
-# CONFIG
-# ----------------------------
-TABLE_NAME = "public.hh"
-DEFAULT_WAIT = 8
 
-# ----------------------------
-# FALLBACK ENGLISH NORMALIZER (NO API)
-# ----------------------------
+# ============================================================
+# CONFIG
+# ============================================================
+TABLE_NAME = os.getenv("HH_TABLE_NAME", "public.hh")
+DEFAULT_WAIT = int(os.getenv("HH_DEFAULT_WAIT", "8"))
+HEADLESS = os.getenv("HEADLESS", "false").strip().lower() == "true"
+HH_MAX_PAGES_PER_KEYWORD = int(os.getenv("HH_MAX_PAGES_PER_KEYWORD", "10"))
+HH_PAGE_SLEEP = float(os.getenv("HH_PAGE_SLEEP", "2"))
+HH_VACANCY_SLEEP = float(os.getenv("HH_VACANCY_SLEEP", "0.7"))
+CHROME_VERSION_MAIN = os.getenv("CHROME_VERSION_MAIN", "147").strip()
+
+HH_BASE_SEARCH_URL = "https://tashkent.hh.uz/search/vacancy"
+
+
+# ============================================================
+# FALLBACK ENGLISH NORMALIZER
+# ============================================================
 _RU2LAT = {
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d",
     "е": "e", "ё": "yo", "ж": "j", "з": "z", "и": "i",
@@ -95,27 +109,36 @@ _PROF_MAP = {
 
 _TEXT_CACHE: dict[str, str] = {}
 
+
 def _has_cyrillic(text: str) -> bool:
     return bool(text) and bool(re.search(r"[А-Яа-яЁё]", text))
 
+
 def _translit_ru_to_lat(text: str) -> str:
     out = []
+
     for ch in text:
         low = ch.lower()
+
         if low in _RU2LAT:
             t = _RU2LAT[low]
+
             if ch.isupper() and t:
                 t = t[0].upper() + t[1:]
+
             out.append(t)
         else:
             out.append(ch)
+
     return "".join(out)
+
 
 def to_english(text: str) -> str:
     if not text:
         return ""
 
     s = text.strip()
+
     if not s:
         return ""
 
@@ -129,23 +152,31 @@ def to_english(text: str) -> str:
         _TEXT_CACHE[s] = res
         return res
 
-    m = re.match(r"^\s*([А-Яа-яЁё]+)\s*[—-]\s*(A1|A2|B1|B2|C1|C2)\s*[—-]\s*([А-Яа-яЁё\- ]+)\s*$", s)
+    m = re.match(
+        r"^\s*([А-Яа-яЁё]+)\s*[—-]\s*(A1|A2|B1|B2|C1|C2)\s*[—-]\s*([А-Яа-яЁё\- ]+)\s*$",
+        s,
+    )
+
     if m:
         lang_ru = m.group(1).strip().lower()
         level = m.group(2).strip()
         prof_ru = m.group(3).strip().lower()
+
         lang_en = _LANG_MAP.get(lang_ru, _translit_ru_to_lat(m.group(1).strip()))
         prof_en = _PROF_MAP.get(prof_ru, _translit_ru_to_lat(m.group(3).strip()))
+
         res = f"{lang_en} - {level} - {prof_en}"
         _TEXT_CACHE[s] = res
         return res
 
     res = s
+
     for ru, en in _MAP_IN_TEXT.items():
         res = re.sub(re.escape(ru), en, res, flags=re.IGNORECASE)
 
     for ru, en in _LANG_MAP.items():
         res = re.sub(rf"\b{re.escape(ru)}\b", en, res, flags=re.IGNORECASE)
+
     for ru, en in _PROF_MAP.items():
         res = re.sub(rf"\b{re.escape(ru)}\b", en, res, flags=re.IGNORECASE)
 
@@ -154,44 +185,67 @@ def to_english(text: str) -> str:
 
     res = re.sub(r"\s+", " ", res).strip()
     _TEXT_CACHE[s] = res
+
     return res
+
 
 def normalize_skills_csv(skills_csv: str) -> str:
     if not skills_csv:
         return ""
+
     items = [x.strip() for x in skills_csv.split(",") if x.strip()]
-    out, seen = [], set()
-    for it in items:
-        en = to_english(it)
+    out = []
+    seen = set()
+
+    for item in items:
+        en = to_english(item)
+
         if en and en not in seen:
             out.append(en)
             seen.add(en)
+
     return ",".join(out)
+
 
 def normalize_salary_range(s: str) -> str:
     if not s:
         return ""
+
     raw = s.strip()
+
     if not raw:
         return ""
 
-    t = raw.lower().replace("from", "ot").replace("up to", "do")
+    t = raw.lower()
+    t = t.replace("from", "ot")
+    t = t.replace("up to", "do")
+    t = t.replace("до вычета налогов", "")
+    t = t.replace("на руки", "")
 
     cur = ""
-    cur_m = re.search(r"(?i)\b(usd|eur|gbp|kzt|rub|uah|byn|br|pln|try|aed|sar|cad|aud|chf|sek|nok|dkk)\b", raw)
+
+    cur_m = re.search(
+        r"(?i)\b(usd|eur|gbp|kzt|rub|uah|byn|br|pln|try|aed|sar|cad|aud|chf|sek|nok|dkk|uzs)\b",
+        raw,
+    )
+
     if cur_m:
-        cur = cur_m.group(1)
+        cur = cur_m.group(1).upper()
     else:
         sym_m = re.search(r"[\$€£₽₸]", raw)
+
         if sym_m:
             cur = sym_m.group(0)
 
     def _num_after(keyword: str) -> Optional[str]:
         m = re.search(rf"\b{keyword}\b\s*([\d\s]+)", t)
+
         if not m:
             return None
+
         n = re.sub(r"[^\d\s]", "", m.group(1))
         n = re.sub(r"\s+", " ", n).strip()
+
         return n or None
 
     frm = _num_after("ot")
@@ -207,26 +261,31 @@ def normalize_salary_range(s: str) -> str:
         nums = re.findall(r"\d[\d\s]*\d|\d+", t)
         nums = [re.sub(r"[^\d\s]", "", n) for n in nums]
         nums = [re.sub(r"\s+", " ", n).strip() for n in nums if n.strip()]
+
         if not nums:
             return ""
+
         out = f"{nums[0]} - {nums[1]}" if len(nums) >= 2 else nums[0]
 
     return f"{out} {cur}".strip() if cur else out
 
 
-# ----------------------------
-# COUNTRY RESOLVER (OFFLINE) for HH
-# ----------------------------
+# ============================================================
+# COUNTRY RESOLVER
+# ============================================================
 gc = geonamescache.GeonamesCache()
 _CITIES = gc.get_cities()
 _COUNTRIES = gc.get_countries()
 
 _CITY_TO_CC: Dict[str, Set[str]] = {}
+
 for _id, c in _CITIES.items():
     name = (c.get("name") or "").strip().lower()
     cc = (c.get("countrycode") or "").strip().upper()
+
     if not name or not cc:
         continue
+
     _CITY_TO_CC.setdefault(name, set()).add(cc)
 
 EXTRA_CITY_ALIASES = {
@@ -234,93 +293,122 @@ EXTRA_CITY_ALIASES = {
     "nyc": "new york",
     "la": "los angeles",
     "dc": "washington",
+    "tashkent": "tashkent",
+    "toshkent": "tashkent",
 }
+
 for k, v in EXTRA_CITY_ALIASES.items():
     if v in _CITY_TO_CC:
         _CITY_TO_CC.setdefault(k, set()).update(_CITY_TO_CC[v])
 
 US_STATE_ABBR = {
-    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id", "il", "in", "ia", "ks", "ky", "la",
-    "me", "md", "ma", "mi", "mn", "ms", "mo", "mt", "ne", "nv", "nh", "nj", "nm", "ny", "nc", "nd", "oh", "ok",
-    "or", "pa", "ri", "sc", "sd", "tn", "tx", "ut", "vt", "va", "wa", "wv", "wi", "wy", "dc"
+    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id", "il", "in",
+    "ia", "ks", "ky", "la", "me", "md", "ma", "mi", "mn", "ms", "mo", "mt", "ne",
+    "nv", "nh", "nj", "nm", "ny", "nc", "nd", "oh", "ok", "or", "pa", "ri", "sc",
+    "sd", "tn", "tx", "ut", "vt", "va", "wa", "wv", "wi", "wy", "dc",
 }
 
 CA_PROVINCES = {
-    "ontario", "quebec", "british columbia", "alberta", "manitoba", "saskatchewan",
-    "nova scotia", "new brunswick", "newfoundland and labrador", "prince edward island",
-    "northwest territories", "nunavut", "yukon"
+    "ontario",
+    "quebec",
+    "british columbia",
+    "alberta",
+    "manitoba",
+    "saskatchewan",
+    "nova scotia",
+    "new brunswick",
+    "newfoundland and labrador",
+    "prince edward island",
+    "northwest territories",
+    "nunavut",
+    "yukon",
 }
 
 _LOCATION_CACHE: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
 
+
 def _cc_to_country_name(cc: str) -> Optional[str]:
     cc = (cc or "").upper().strip()
+
     if not cc:
         return None
+
     info = _COUNTRIES.get(cc)
+
     if info and info.get("name"):
         return info["name"]
+
     obj = pycountry.countries.get(alpha_2=cc)
+
     return obj.name if obj else None
+
 
 def _country_code_from_text(token: str) -> Optional[str]:
     t = (token or "").strip()
+
     if not t:
         return None
+
     low = t.lower()
 
     if low in {"us", "u.s.", "usa", "united states", "united states of america"}:
         return "US"
+
     if low in {"uk", "u.k.", "united kingdom", "britain", "england"}:
         return "GB"
+
     if low in {"uae", "united arab emirates"}:
         return "AE"
 
-    # 2-letter code
+    if low in {"uzbekistan", "uzbekistan republic", "o'zbekiston", "uz"}:
+        return "UZ"
+
+    if low in {"kazakhstan", "kz"}:
+        return "KZ"
+
+    if low in {"russia", "russian federation", "ru"}:
+        return "RU"
+
     if re.fullmatch(r"[a-z]{2}", low):
         cc = low.upper()
+
         if pycountry.countries.get(alpha_2=cc):
             return cc
+
         return None
 
-    # 3-letter -> alpha_2
     if re.fullmatch(r"[a-z]{3}", low):
         obj = pycountry.countries.get(alpha_3=low.upper())
+
         return obj.alpha_2 if obj else None
 
-    # fuzzy
     try:
         matches = pycountry.countries.search_fuzzy(t)
+
         if matches:
             return matches[0].alpha_2
+
     except Exception:
         pass
 
     return None
 
+
 def extract_country_name_and_code_from_location(location: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Input location example (after to_english):
-      "Tashkent", "Almaty", "Tashkent, Uzbekistan", "Uzbekistan", "UZ", etc.
-    Output:
-      ("Uzbekistan", "UZ")
-      ("Kazakhstan", "KZ")
-      ("United States; Canada", "US; CA")
-    """
     if not location:
         return None, None
 
     s = location.strip()
+
     if not s:
         return None, None
 
     key = s.lower()
+
     if key in _LOCATION_CACHE:
         return _LOCATION_CACHE[key]
 
     low = key
-
-    # normalize separators and noise
     low = low.replace("&", " and ")
     low = re.sub(r"\bor\b", " ", low)
     low = re.sub(r"\s+", " ", low).strip()
@@ -334,35 +422,37 @@ def extract_country_name_and_code_from_location(location: str) -> Tuple[Optional
         parts = [p.strip() for p in chunk.split(",") if p.strip()]
         joined = " ".join(parts)
 
-        # detect codes/names directly
         for p in parts:
             cc = _country_code_from_text(p)
+
             if cc:
                 found_cc.add(cc)
 
         cc2 = _country_code_from_text(joined)
+
         if cc2:
             found_cc.add(cc2)
 
-        # detect US/CA by state/province
         for p in parts:
             p2 = p.lower()
+
             if p2 in US_STATE_ABBR:
                 found_cc.add("US")
+
             if p2 in CA_PROVINCES:
                 found_cc.add("CA")
 
-        # city->country via geonamescache (first part)
         if parts:
             city = parts[0].lower().strip()
             city = EXTRA_CITY_ALIASES.get(city, city)
+
             if city in _CITY_TO_CC:
                 for cc in _CITY_TO_CC[city]:
                     found_cc.add(cc)
 
-        # whole chunk as city
         c2 = chunk.lower().strip()
         c2 = EXTRA_CITY_ALIASES.get(c2, c2)
+
         if c2 in _CITY_TO_CC:
             for cc in _CITY_TO_CC[c2]:
                 found_cc.add(cc)
@@ -374,32 +464,38 @@ def extract_country_name_and_code_from_location(location: str) -> Tuple[Optional
 
     names: List[str] = []
     codes: List[str] = []
+
     for cc in sorted(found_cc):
         cname = _cc_to_country_name(cc)
+
         if cname and cname not in names:
             names.append(cname)
+
         if cc not in codes:
             codes.append(cc)
 
     res = ("; ".join(names), "; ".join(codes))
     _LOCATION_CACHE[key] = res
+
     return res
 
 
-# ----------------------------
+# ============================================================
 # DB
-# ----------------------------
-conn = psycopg2.connect(
-    host=os.getenv("DB_HOST"),
-    port=os.getenv("DB_PORT"),
-    dbname=os.getenv("DB_NAME"),
-    user=os.getenv("DB_USER"),
-    password=os.getenv("DB_PASSWORD"),
-)
-conn.autocommit = True
-cursor = conn.cursor()
+# ============================================================
+def get_db_connection():
+    conn = psycopg2.connect(
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT"),
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+    )
+    conn.autocommit = True
+    return conn
 
-def create_table_if_not_exists():
+
+def create_table_if_not_exists(cursor):
     cursor.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -424,13 +520,10 @@ def create_table_if_not_exists():
         """
     )
 
-    # safety for existing table
     cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS id BIGSERIAL;")
     cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();")
     cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS job_subtitle TEXT;")
     cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS search_query TEXT;")
-
-    # ✅ NEW
     cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS country TEXT;")
     cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS country_code TEXT;")
 
@@ -439,7 +532,8 @@ def create_table_if_not_exists():
         DO $$
         BEGIN
             IF NOT EXISTS (
-                SELECT 1 FROM pg_indexes
+                SELECT 1
+                FROM pg_indexes
                 WHERE schemaname = split_part('{TABLE_NAME}', '.', 1)
                   AND tablename  = split_part('{TABLE_NAME}', '.', 2)
                   AND indexname  = 'hh_job_id_unique'
@@ -450,14 +544,29 @@ def create_table_if_not_exists():
         """
     )
 
-def save_to_database(cursor, data: dict):
+    print("[DB] hh table ready ✅")
+
+
+def save_to_database(cursor, data: dict) -> bool:
     try:
         cursor.execute(
             f"""
             INSERT INTO {TABLE_NAME} (
-                job_id, job_title, location, country, country_code, skills, salary,
-                education, job_type, company_name, job_url,
-                source, posted_date, job_subtitle, search_query
+                job_id,
+                job_title,
+                location,
+                country,
+                country_code,
+                skills,
+                salary,
+                education,
+                job_type,
+                company_name,
+                job_url,
+                source,
+                posted_date,
+                job_subtitle,
+                search_query
             )
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (job_id) DO NOTHING;
@@ -480,75 +589,206 @@ def save_to_database(cursor, data: dict):
                 data["search_query"],
             ),
         )
+
         return cursor.rowcount == 1
 
     except Exception as e:
-        print(f"❌ DB ERROR: {e}")
+        print(f"❌ DB ERROR: {type(e).__name__}: {e}")
         return False
 
 
-# ----------------------------
-# DRIVER
-# ----------------------------
+# ============================================================
+# DRIVER SAFE LAYER
+# ============================================================
 def create_driver():
     options = uc.ChromeOptions()
 
-    if os.getenv("HEADLESS", "false").lower() == "true":
+    if HEADLESS:
         options.add_argument("--headless=new")
 
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")                 # 🔧 qo‘sh
-    options.add_argument("--disable-extensions")          # 🔧 qo‘sh
-    options.add_argument("--disable-infobars")            # 🔧 qo‘sh
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-infobars")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--disable-notifications")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--remote-allow-origins=*")
 
-    # 🔧 page load tezroq va kamroq crash
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-renderer-backgrounding")
+
     options.page_load_strategy = "eager"
 
-    # 🔧 real user-agent
     options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/147.0.0.0 Safari/537.36"
     )
 
-    return uc.Chrome(options=options, version_main=147)
+    try:
+        if CHROME_VERSION_MAIN:
+            driver = uc.Chrome(options=options, version_main=int(CHROME_VERSION_MAIN))
+        else:
+            driver = uc.Chrome(options=options)
+    except Exception as e:
+        print(f"[DRIVER CREATE WARN] version_main failed: {type(e).__name__}: {e}")
+        driver = uc.Chrome(options=options)
+
+    driver.set_page_load_timeout(45)
+    driver.implicitly_wait(3)
+
+    return driver
 
 
-def safe_text(driver, xpath: str, retries=3) -> str:
+def safe_quit_driver(driver):
+    try:
+        if driver:
+            driver.quit()
+    except Exception:
+        pass
+
+
+def restart_driver(driver):
+    print("[DRIVER] restarting Chrome...")
+    safe_quit_driver(driver)
+    time.sleep(2)
+
+    driver = create_driver()
+    wait = WebDriverWait(driver, DEFAULT_WAIT)
+
+    return driver, wait
+
+
+def is_driver_dead_error(e: Exception) -> bool:
+    return isinstance(
+        e,
+        (
+            NoSuchWindowException,
+            InvalidSessionIdException,
+            WebDriverException,
+        ),
+    )
+
+
+def safe_get(driver, wait, url: str, retries: int = 3):
+    last_err = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            driver.get(url)
+            return driver, wait, True
+
+        except (NoSuchWindowException, InvalidSessionIdException, WebDriverException) as e:
+            last_err = e
+            print(f"[DRIVER GET DEAD] attempt={attempt}/{retries}")
+            print(f"[URL] {url}")
+            print(f"[ERR] {type(e).__name__}: {str(e)[:250]}")
+            driver, wait = restart_driver(driver)
+
+        except Exception as e:
+            last_err = e
+            print(f"[DRIVER GET ERROR] attempt={attempt}/{retries}")
+            print(f"[URL] {url}")
+            print(f"[ERR] {type(e).__name__}: {str(e)[:250]}")
+            time.sleep(2)
+
+    print(f"[SAFE_GET FAILED] url={url} err={last_err}")
+    return driver, wait, False
+
+
+def safe_wait_presence(driver, wait, locator, label: str, retries: int = 2) -> bool:
+    last_err = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            wait.until(EC.presence_of_element_located(locator))
+            return True
+
+        except TimeoutException as e:
+            last_err = e
+            print(f"[WAIT TIMEOUT] {label} attempt={attempt}/{retries}")
+            time.sleep(1)
+
+        except (NoSuchWindowException, InvalidSessionIdException, WebDriverException) as e:
+            last_err = e
+            print(f"[WAIT DRIVER DEAD] {label} attempt={attempt}/{retries}")
+            print(f"[ERR] {type(e).__name__}: {str(e)[:250]}")
+            return False
+
+    print(f"[WAIT FAILED] {label} err={last_err}")
+    return False
+
+
+def safe_find_elements(driver, by, value) -> list:
+    try:
+        return driver.find_elements(by, value)
+    except (NoSuchWindowException, InvalidSessionIdException, WebDriverException):
+        return []
+    except Exception:
+        return []
+
+
+def safe_page_source(driver) -> str:
+    try:
+        return driver.page_source or ""
+    except (NoSuchWindowException, InvalidSessionIdException, WebDriverException):
+        return ""
+    except Exception:
+        return ""
+
+
+def safe_text(driver, xpath: str, retries: int = 3) -> str:
     for _ in range(retries):
         try:
-            el = WebDriverWait(driver, 3).until(   # 🔧 5 → 3
+            el = WebDriverWait(driver, 3).until(
                 EC.presence_of_element_located((By.XPATH, xpath))
             )
             return el.text.strip()
-        except (StaleElementReferenceException, TimeoutException):
-            time.sleep(0.2)   # 🔧 kamaytirildi
-        except NoSuchElementException:
+
+        except (StaleElementReferenceException, TimeoutException, NoSuchElementException):
+            time.sleep(0.2)
+
+        except (NoSuchWindowException, InvalidSessionIdException, WebDriverException):
             return ""
+
+        except Exception:
+            return ""
+
     return ""
 
 
-# ----------------------------
+# ============================================================
 # VALIDATION
-# ----------------------------
+# ============================================================
 def is_valid_job_id(job_id: str) -> bool:
     return bool(job_id) and job_id.isdigit() and len(job_id) >= 6
+
 
 def is_valid_job_title(title: str) -> bool:
     if not title or len(title) < 5:
         return False
+
     bad_words = (
-        "найдено", "vacancy", "employers", "работодател",
-        "ооо ", "тоо ", "ип ", "ao ", "ltd",
+        "найдено",
+        "vacancy",
+        "employers",
+        "работодател",
+        "ооо ",
+        "тоо ",
+        "ип ",
+        "ao ",
+        "ltd",
     )
+
     t = title.lower()
+
     return not any(bad in t for bad in bad_words)
 
 
-# ----------------------------
-# SEARCH QUERY (from URL)
-# ----------------------------
 def extract_search_query_from_url(url: str) -> str:
     try:
         qs = parse_qs(urlparse(url).query)
@@ -558,80 +798,138 @@ def extract_search_query_from_url(url: str) -> str:
         return ""
 
 
-# ----------------------------
-# POSTED DATE (HH)
-# ----------------------------
+# ============================================================
+# POSTED DATE
+# ============================================================
 _RU_MONTHS = {
-    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
-    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
 }
+
 
 def parse_posted_date_from_text(text: str) -> Optional[datetime.date]:
     if not text:
         return None
+
     t = text.strip().lower()
     today = datetime.date.today()
 
     if "сегодня" in t:
         return today
+
     if "вчера" in t:
         return today - datetime.timedelta(days=1)
 
     m = re.search(r"(\d+)\s*(дн(?:я|ей)|день)\s*назад", t)
+
     if m:
         return today - datetime.timedelta(days=int(m.group(1)))
 
     m = re.search(r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})", t)
+
     if m:
         day = int(m.group(1))
         mon_name = m.group(2)
         year = int(m.group(3))
         mon = _RU_MONTHS.get(mon_name)
+
         if mon:
             return datetime.date(year, mon, day)
 
     return None
 
+
 def get_hh_posted_date(driver) -> datetime.date:
     candidates = []
+
     xpaths = [
         "//*[@data-qa='vacancy-view-creation-time']",
         "//*[contains(text(),'Вакансия опубликована')]",
         "//*[contains(text(),'Опубликовано')]",
     ]
+
     for xp in xpaths:
         txt = safe_text(driver, xp)
+
         if txt:
             candidates.append(txt)
 
-    html = driver.page_source or ""
-    m = re.search(r"(Вакансия опубликована[^<]{0,120})", html, flags=re.IGNORECASE)
-    if m:
-        candidates.append(m.group(1))
-    m2 = re.search(r"(Опубликовано[^<]{0,120})", html, flags=re.IGNORECASE)
-    if m2:
-        candidates.append(m2.group(1))
+    html = safe_page_source(driver)
 
-    for c in candidates:
-        dt = parse_posted_date_from_text(c)
-        if dt:
-            return dt
+    if html:
+        m = re.search(r"(Вакансия опубликована[^<]{0,120})", html, flags=re.IGNORECASE)
+
+        if m:
+            candidates.append(m.group(1))
+
+        m2 = re.search(r"(Опубликовано[^<]{0,120})", html, flags=re.IGNORECASE)
+
+        if m2:
+            candidates.append(m2.group(1))
+
+    for candidate in candidates:
+        parsed_date = parse_posted_date_from_text(candidate)
+
+        if parsed_date:
+            return parsed_date
 
     return datetime.date.today()
 
 
-# ----------------------------
-# SEARCH PAGE URLS
-# ----------------------------
+# ============================================================
+# SEARCH RESULT URLS
+# ============================================================
 def get_search_result_urls(driver, wait) -> List[str]:
-    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a[data-qa='serp-item__title']")))
+    ok = safe_wait_presence(
+        driver,
+        wait,
+        (By.TAG_NAME, "body"),
+        "search body",
+        retries=2,
+    )
 
-    links = driver.find_elements(By.CSS_SELECTOR, "a[data-qa='serp-item__title']")
+    if not ok:
+        return []
+
+    cards_exist = safe_wait_presence(
+        driver,
+        wait,
+        (By.CSS_SELECTOR, "a[data-qa='serp-item__title']"),
+        "search result links",
+        retries=1,
+    )
+
+    if not cards_exist:
+        html = safe_page_source(driver)
+
+        if "captcha" in html.lower() or "подтвердите" in html.lower():
+            print("❌ HH CAPTCHA / BLOCK detected")
+        else:
+            print("❌ PAGE NOT LOADED / NO RESULT LINKS")
+
+        return []
+
+    links = safe_find_elements(driver, By.CSS_SELECTOR, "a[data-qa='serp-item__title']")
+
     urls = []
     seen = set()
 
     for a in links:
-        href = a.get_attribute("href")
+        try:
+            href = a.get_attribute("href")
+        except Exception:
+            continue
+
         if not href or "/vacancy/" not in href:
             continue
 
@@ -642,126 +940,277 @@ def get_search_result_urls(driver, wait) -> List[str]:
     return urls
 
 
+# ============================================================
+# PARSE VACANCY
+# ============================================================
+def parse_vacancy_page(driver, vacancy_url: str, keyword: str) -> Optional[dict]:
+    job_id = vacancy_url.split("/")[-1].split("?")[0]
 
-# ----------------------------
+    if not is_valid_job_id(job_id):
+        print(f"[SKIP] invalid job_id={job_id}")
+        return None
+
+    raw_title = safe_text(driver, "//h1")
+
+    if not is_valid_job_title(raw_title):
+        print(f"[SKIP] invalid title={raw_title}")
+        return None
+
+    posted_date = get_hh_posted_date(driver)
+
+    raw_location = safe_text(driver, "//span[@data-qa='vacancy-view-raw-address']")
+
+    if not raw_location:
+        raw_location = safe_text(driver, "//*[@data-qa='vacancy-view-location']")
+
+    raw_skills = safe_text(driver, "//ul[contains(@class,'vacancy-skill-list')]").replace("\n", ",")
+
+    if not raw_skills:
+        skill_elements = safe_find_elements(driver, By.CSS_SELECTOR, "[data-qa='bloko-tag__text']")
+
+        skills = []
+
+        for el in skill_elements:
+            try:
+                txt = el.text.strip()
+                if txt:
+                    skills.append(txt)
+            except Exception:
+                pass
+
+        raw_skills = ",".join(skills)
+
+    raw_salary = safe_text(driver, "//span[contains(@data-qa,'vacancy-salary')]")
+
+    if not raw_salary:
+        raw_salary = safe_text(driver, "//*[@data-qa='vacancy-salary']")
+
+    raw_job_type = safe_text(driver, "//div[@data-qa='vacancy-working-hours']")
+
+    if not raw_job_type:
+        raw_job_type = safe_text(driver, "//*[contains(@data-qa,'vacancy-view-employment-mode')]")
+
+    raw_company = safe_text(driver, "//div[@data-qa='vacancy-company__details']")
+
+    if not raw_company:
+        raw_company = safe_text(driver, "//*[@data-qa='vacancy-company-name']")
+
+    location = to_english(raw_location)
+    country, country_code = extract_country_name_and_code_from_location(location)
+
+    data = {
+        "job_id": job_id,
+        "job_title": to_english(raw_title),
+        "location": location,
+        "country": country,
+        "country_code": country_code,
+        "skills": normalize_skills_csv(raw_skills),
+        "salary": normalize_salary_range(to_english(raw_salary)),
+        "education": "",
+        "job_type": to_english(raw_job_type),
+        "company_name": to_english(raw_company),
+        "job_url": vacancy_url,
+        "source": "hh.uz",
+        "posted_date": posted_date,
+        "job_subtitle": str(keyword),
+        "search_query": str(keyword),
+    }
+
+    return data
+
+
+# ============================================================
 # SCRAPER
-# ----------------------------
+# ============================================================
 def get_hh_vacancies(jobs_list):
-
-    conn = psycopg2.connect(
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT"),
-        dbname=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-    )
-    conn.autocommit = True
+    conn = get_db_connection()
     cursor = conn.cursor()
 
-    create_table_if_not_exists()
+    create_table_if_not_exists(cursor)
 
-    driver = create_driver()
-    wait = WebDriverWait(driver, DEFAULT_WAIT)
+    driver = None
+    wait = None
+
+    inserted = 0
+    duplicates = 0
+    parse_failed = 0
+    pages_scanned = 0
+    driver_restarts = 0
 
     try:
+        driver = create_driver()
+        wait = WebDriverWait(driver, DEFAULT_WAIT)
+
         for job in jobs_list:
             page = 0
 
             while True:
                 q = quote_plus(str(job))
-                url = f"https://tashkent.hh.uz/search/vacancy?text={q}&page={page}"
+                search_url = f"{HH_BASE_SEARCH_URL}?text={q}&page={page}"
 
-                driver.get(url)
+                print(f"\n[SEARCH] job={job} page={page}")
+                print(f"[URL] {search_url}")
 
-                try:
-                    urls = get_search_result_urls(driver, wait)
-                except TimeoutException:
+                driver, wait, ok = safe_get(driver, wait, search_url)
+
+                if not ok:
+                    print(f"[SKIP PAGE] cannot open search page: {search_url}")
+                    driver, wait = restart_driver(driver)
+                    driver_restarts += 1
                     break
+
+                body_ok = safe_wait_presence(
+                    driver,
+                    wait,
+                    (By.TAG_NAME, "body"),
+                    "search body",
+                    retries=2,
+                )
+
+                if not body_ok:
+                    print("[RESTART] Chrome died on search body wait")
+                    driver, wait = restart_driver(driver)
+                    driver_restarts += 1
+                    continue
+
+                time.sleep(HH_PAGE_SLEEP)
+
+                urls = get_search_result_urls(driver, wait)
 
                 if not urls:
+                    print(f"[STOP] no vacancies found for job={job}, page={page}")
                     break
+
+                pages_scanned += 1
+                print(f"[FOUND] urls={len(urls)}")
 
                 for vacancy_url in urls:
                     try:
-                        driver.get(vacancy_url)
+                        print(f"[VACANCY] {vacancy_url}")
 
-                        # 🔥 WAIT qo‘shildi (sleep o‘rniga)
-                        wait.until(EC.presence_of_element_located((By.XPATH, "//h1")))
+                        driver, wait, ok = safe_get(driver, wait, vacancy_url)
 
-                        job_id = vacancy_url.split("/")[-1].split("?")[0]
-                        if not is_valid_job_id(job_id):
+                        if not ok:
+                            parse_failed += 1
+                            print(f"[SKIP VACANCY] cannot open: {vacancy_url}")
+                            driver, wait = restart_driver(driver)
+                            driver_restarts += 1
                             continue
 
-                        raw_title = safe_text(driver, "//h1")
-                        if not is_valid_job_title(raw_title):
+                        h1_ok = safe_wait_presence(
+                            driver,
+                            wait,
+                            (By.XPATH, "//h1"),
+                            "vacancy h1",
+                            retries=2,
+                        )
+
+                        if not h1_ok:
+                            parse_failed += 1
+                            print(f"[SKIP VACANCY] h1 not loaded or driver died: {vacancy_url}")
+                            driver, wait = restart_driver(driver)
+                            driver_restarts += 1
                             continue
 
-                        posted_date = get_hh_posted_date(driver)
+                        data = parse_vacancy_page(driver, vacancy_url, str(job))
 
-                        raw_location = safe_text(driver, "//span[@data-qa='vacancy-view-raw-address']")
-
-                        # 🔥 SKILLS FAST FIX
-                        raw_skills = safe_text(driver, "//ul[contains(@class,'vacancy-skill-list')]").replace("\n", ",")
-
-                        raw_salary = safe_text(driver, "//span[contains(@data-qa,'vacancy-salary')]")
-                        raw_job_type = safe_text(driver, "//div[@data-qa='vacancy-working-hours']")
-                        raw_company = safe_text(driver, "//div[@data-qa='vacancy-company__details']")
-
-                        location = to_english(raw_location)
-
-                        country, country_code = extract_country_name_and_code_from_location(location)
-
-                        data = {
-                            "job_id": job_id,
-                            "job_title": to_english(raw_title),
-                            "location": location,
-                            "country": country,
-                            "country_code": country_code,
-                            "skills": normalize_skills_csv(raw_skills),
-                            "salary": normalize_salary_range(to_english(raw_salary)),
-                            "education": "",
-                            "job_type": to_english(raw_job_type),
-                            "company_name": to_english(raw_company),
-                            "job_url": vacancy_url,
-                            "source": "hh.uz",
-                            "posted_date": posted_date,
-                            "job_subtitle": str(job),
-                            "search_query": extract_search_query_from_url(vacancy_url),
-                        }
+                        if not data:
+                            parse_failed += 1
+                            continue
 
                         saved = save_to_database(cursor, data)
 
                         if saved:
-                            print(f"✅ {job_id} | {country_code}")
+                            inserted += 1
+                            print(
+                                f"✅ SAVED {data['job_id']} | "
+                                f"{data['job_title']} | "
+                                f"{data.get('country_code')}"
+                            )
                         else:
-                            print(f"⚠️ DUPLICATE {job_id}")
+                            duplicates += 1
+                            print(f"⚠️ DUPLICATE {data['job_id']}")
+
+                        time.sleep(HH_VACANCY_SLEEP)
+
+                    except (NoSuchWindowException, InvalidSessionIdException, WebDriverException) as e:
+                        parse_failed += 1
+                        print(f"[VACANCY DRIVER ERROR] {type(e).__name__}: {str(e)[:250]}")
+                        driver, wait = restart_driver(driver)
+                        driver_restarts += 1
+                        continue
 
                     except Exception as e:
-                        print(f"❌ PARSE ERROR: {e}")
+                        parse_failed += 1
+                        print(f"❌ PARSE ERROR: {type(e).__name__}: {e}")
                         continue
 
                 page += 1
 
+                if page >= HH_MAX_PAGES_PER_KEYWORD:
+                    print(f"[STOP] max pages reached for keyword={job}: {HH_MAX_PAGES_PER_KEYWORD}")
+                    break
+
     finally:
-        driver.quit()
-        cursor.close()
-        conn.close()
+        safe_quit_driver(driver)
+
+        try:
+            cursor.close()
+            conn.close()
+        except Exception:
+            pass
+
+        print("\nDONE ✅")
+        print(f"inserted={inserted}")
+        print(f"duplicates={duplicates}")
+        print(f"parse_failed={parse_failed}")
+        print(f"pages_scanned={pages_scanned}")
+        print(f"driver_restarts={driver_restarts}")
 
 
-def main():
-    create_table_if_not_exists()
+# ============================================================
+# JOB LIST
+# ============================================================
+def load_jobs(path: str = "job_list.json") -> list[str]:
+    if not os.path.exists(path):
+        print(f"[WARN] {path} not found")
+        return []
 
-    with open("job_list.json", "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         jobs = json.load(f)
 
     if isinstance(jobs, dict):
-        for k in ("jobs", "keywords", "list"):
-            if k in jobs and isinstance(jobs[k], list):
-                jobs = jobs[k]
+        for key in ("jobs", "keywords", "list"):
+            if key in jobs and isinstance(jobs[key], list):
+                jobs = jobs[key]
                 break
 
-    jobs = [str(x).strip() for x in jobs if str(x).strip()]
+    if not isinstance(jobs, list):
+        print("[WARN] job_list.json must be list or dict with jobs/keywords/list")
+        return []
+
+    result = []
+
+    for item in jobs:
+        value = str(item).strip()
+
+        if value:
+            result.append(value)
+
+    return result
+
+
+def main():
+    jobs = load_jobs("job_list.json")
+
+    if not jobs:
+        print("[STOP] no jobs loaded from job_list.json")
+        return
+
+    print(f"[KEYWORDS] loaded={len(jobs)}")
+
     get_hh_vacancies(jobs)
+
     print("DONE")
 
 
@@ -769,6 +1218,3 @@ if __name__ == "__main__":
     main()
 
 
-"""
-pip install geonamescache pycountry
-"""
