@@ -31,12 +31,15 @@ load_dotenv()
 # CONFIG
 # ============================================================
 TABLE_NAME = os.getenv("HH_TABLE_NAME", "public.hh")
-DEFAULT_WAIT = int(os.getenv("HH_DEFAULT_WAIT", "8"))
+
+DEFAULT_WAIT = int(os.getenv("HH_DEFAULT_WAIT", "5"))
 HEADLESS = os.getenv("HEADLESS", "false").strip().lower() == "true"
+
 HH_MAX_PAGES_PER_KEYWORD = int(os.getenv("HH_MAX_PAGES_PER_KEYWORD", "10"))
-HH_PAGE_SLEEP = float(os.getenv("HH_PAGE_SLEEP", "2"))
-HH_VACANCY_SLEEP = float(os.getenv("HH_VACANCY_SLEEP", "0.7"))
-CHROME_VERSION_MAIN = os.getenv("CHROME_VERSION_MAIN", "147").strip()
+HH_PAGE_SLEEP = float(os.getenv("HH_PAGE_SLEEP", "0.7"))
+HH_VACANCY_SLEEP = float(os.getenv("HH_VACANCY_SLEEP", "0.2"))
+
+CHROME_VERSION_MAIN = os.getenv("CHROME_VERSION_MAIN", "").strip()
 
 HH_BASE_SEARCH_URL = "https://tashkent.hh.uz/search/vacancy"
 
@@ -56,6 +59,8 @@ _RU2LAT = {
 
 _MAP_EXACT = {
     "ташкент": "Tashkent",
+    "тoшкент": "Tashkent",
+    "toshkent": "Tashkent",
     "минск": "Minsk",
     "москва": "Moscow",
     "астана": "Astana",
@@ -80,6 +85,8 @@ _MAP_EXACT = {
 _MAP_IN_TEXT = {
     "за месяц": "per month",
     "на руки": "net",
+    "до вычета налогов": "gross",
+    "после вычета налогов": "net",
     "обучение и развитие": "Training & Development",
     "аналитическое мышление": "Analytical Thinking",
     "управление командой": "Team Management",
@@ -90,6 +97,10 @@ _MAP_IN_TEXT = {
     "стилизация изображений": "Image Styling",
     "моушн-дизайн": "Motion Design",
     "веб-дизайн": "Web Design",
+    "удаленно": "Remote",
+    "удалённо": "Remote",
+    "полная занятость": "Full Time",
+    "частичная занятость": "Part Time",
 }
 
 _LANG_MAP = {
@@ -137,7 +148,7 @@ def to_english(text: str) -> str:
     if not text:
         return ""
 
-    s = text.strip()
+    s = re.sub(r"\s+", " ", text.strip())
 
     if not s:
         return ""
@@ -211,7 +222,7 @@ def normalize_salary_range(s: str) -> str:
     if not s:
         return ""
 
-    raw = s.strip()
+    raw = re.sub(r"\s+", " ", s.strip())
 
     if not raw:
         return ""
@@ -623,6 +634,14 @@ def create_driver():
 
     options.page_load_strategy = "eager"
 
+    prefs = {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.default_content_setting_values.notifications": 2,
+        "profile.managed_default_content_settings.stylesheets": 2,
+        "profile.managed_default_content_settings.fonts": 2,
+    }
+    options.add_experimental_option("prefs", prefs)
+
     options.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -638,8 +657,38 @@ def create_driver():
         print(f"[DRIVER CREATE WARN] version_main failed: {type(e).__name__}: {e}")
         driver = uc.Chrome(options=options)
 
-    driver.set_page_load_timeout(45)
-    driver.implicitly_wait(3)
+    driver.set_page_load_timeout(25)
+    driver.implicitly_wait(0)
+
+    try:
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd(
+            "Network.setBlockedURLs",
+            {
+                "urls": [
+                    "*.png",
+                    "*.jpg",
+                    "*.jpeg",
+                    "*.gif",
+                    "*.webp",
+                    "*.svg",
+                    "*.css",
+                    "*.woff",
+                    "*.woff2",
+                    "*.ttf",
+                    "*google-analytics*",
+                    "*yandex*",
+                    "*doubleclick*",
+                    "*adservice*",
+                    "*ads*",
+                    "*analytics*",
+                    "*counter*",
+                    "*metrics*",
+                ]
+            },
+        )
+    except Exception:
+        pass
 
     return driver
 
@@ -655,7 +704,7 @@ def safe_quit_driver(driver):
 def restart_driver(driver):
     print("[DRIVER] restarting Chrome...")
     safe_quit_driver(driver)
-    time.sleep(2)
+    time.sleep(1)
 
     driver = create_driver()
     wait = WebDriverWait(driver, DEFAULT_WAIT)
@@ -663,18 +712,7 @@ def restart_driver(driver):
     return driver, wait
 
 
-def is_driver_dead_error(e: Exception) -> bool:
-    return isinstance(
-        e,
-        (
-            NoSuchWindowException,
-            InvalidSessionIdException,
-            WebDriverException,
-        ),
-    )
-
-
-def safe_get(driver, wait, url: str, retries: int = 3):
+def safe_get(driver, wait, url: str, retries: int = 2):
     last_err = None
 
     for attempt in range(1, retries + 1):
@@ -686,40 +724,34 @@ def safe_get(driver, wait, url: str, retries: int = 3):
             last_err = e
             print(f"[DRIVER GET DEAD] attempt={attempt}/{retries}")
             print(f"[URL] {url}")
-            print(f"[ERR] {type(e).__name__}: {str(e)[:250]}")
+            print(f"[ERR] {type(e).__name__}: {str(e)[:200]}")
             driver, wait = restart_driver(driver)
 
         except Exception as e:
             last_err = e
             print(f"[DRIVER GET ERROR] attempt={attempt}/{retries}")
             print(f"[URL] {url}")
-            print(f"[ERR] {type(e).__name__}: {str(e)[:250]}")
-            time.sleep(2)
+            print(f"[ERR] {type(e).__name__}: {str(e)[:200]}")
+            time.sleep(1)
 
     print(f"[SAFE_GET FAILED] url={url} err={last_err}")
     return driver, wait, False
 
 
-def safe_wait_presence(driver, wait, locator, label: str, retries: int = 2) -> bool:
-    last_err = None
-
+def safe_wait_presence(driver, wait, locator, label: str, retries: int = 1) -> bool:
     for attempt in range(1, retries + 1):
         try:
             wait.until(EC.presence_of_element_located(locator))
             return True
 
-        except TimeoutException as e:
-            last_err = e
+        except TimeoutException:
             print(f"[WAIT TIMEOUT] {label} attempt={attempt}/{retries}")
-            time.sleep(1)
 
         except (NoSuchWindowException, InvalidSessionIdException, WebDriverException) as e:
-            last_err = e
             print(f"[WAIT DRIVER DEAD] {label} attempt={attempt}/{retries}")
-            print(f"[ERR] {type(e).__name__}: {str(e)[:250]}")
+            print(f"[ERR] {type(e).__name__}: {str(e)[:200]}")
             return False
 
-    print(f"[WAIT FAILED] {label} err={last_err}")
     return False
 
 
@@ -741,24 +773,38 @@ def safe_page_source(driver) -> str:
         return ""
 
 
-def safe_text(driver, xpath: str, retries: int = 3) -> str:
-    for _ in range(retries):
+def safe_text(driver, xpath: str) -> str:
+    """
+    MAX speed: element topilmasa kutmaydi.
+    Faqat detail page yuklangandan keyin fieldlarni tez oladi.
+    """
+    try:
+        elements = driver.find_elements(By.XPATH, xpath)
+
+        if not elements:
+            return ""
+
+        return elements[0].text.strip()
+
+    except (NoSuchWindowException, InvalidSessionIdException, WebDriverException):
+        return ""
+    except Exception:
+        return ""
+
+
+def safe_css_texts(driver, selector: str) -> list[str]:
+    out = []
+
+    for el in safe_find_elements(driver, By.CSS_SELECTOR, selector):
         try:
-            el = WebDriverWait(driver, 3).until(
-                EC.presence_of_element_located((By.XPATH, xpath))
-            )
-            return el.text.strip()
+            txt = el.text.strip()
 
-        except (StaleElementReferenceException, TimeoutException, NoSuchElementException):
-            time.sleep(0.2)
-
-        except (NoSuchWindowException, InvalidSessionIdException, WebDriverException):
-            return ""
-
+            if txt:
+                out.append(txt)
         except Exception:
-            return ""
+            pass
 
-    return ""
+    return out
 
 
 # ============================================================
@@ -850,7 +896,29 @@ def parse_posted_date_from_text(text: str) -> Optional[datetime.date]:
 
 
 def get_hh_posted_date(driver) -> datetime.date:
+    """
+    Fast posted date:
+    Avval HTML regex, keyin tezkor XPath. Hech qachon uzun kutmaydi.
+    """
+    html = safe_page_source(driver)
+
     candidates = []
+
+    if html:
+        patterns = [
+            r"(Вакансия опубликована[^<]{0,120})",
+            r"(Опубликовано[^<]{0,120})",
+            r"(сегодня)",
+            r"(вчера)",
+            r"(\d+\s*(?:дня|дней|день)\s*назад)",
+            r"(\d{1,2}\s+[а-яё]+\s+\d{4})",
+        ]
+
+        for pattern in patterns:
+            m = re.search(pattern, html, flags=re.IGNORECASE)
+
+            if m:
+                candidates.append(m.group(1))
 
     xpaths = [
         "//*[@data-qa='vacancy-view-creation-time']",
@@ -863,19 +931,6 @@ def get_hh_posted_date(driver) -> datetime.date:
 
         if txt:
             candidates.append(txt)
-
-    html = safe_page_source(driver)
-
-    if html:
-        m = re.search(r"(Вакансия опубликована[^<]{0,120})", html, flags=re.IGNORECASE)
-
-        if m:
-            candidates.append(m.group(1))
-
-        m2 = re.search(r"(Опубликовано[^<]{0,120})", html, flags=re.IGNORECASE)
-
-        if m2:
-            candidates.append(m2.group(1))
 
     for candidate in candidates:
         parsed_date = parse_posted_date_from_text(candidate)
@@ -895,28 +950,26 @@ def get_search_result_urls(driver, wait) -> List[str]:
         wait,
         (By.TAG_NAME, "body"),
         "search body",
-        retries=2,
+        retries=1,
     )
 
     if not ok:
         return []
 
-    cards_exist = safe_wait_presence(
-        driver,
-        wait,
-        (By.CSS_SELECTOR, "a[data-qa='serp-item__title']"),
-        "search result links",
-        retries=1,
-    )
-
-    if not cards_exist:
+    try:
+        WebDriverWait(driver, 4).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "a[data-qa='serp-item__title']"))
+        )
+    except TimeoutException:
         html = safe_page_source(driver)
 
         if "captcha" in html.lower() or "подтвердите" in html.lower():
             print("❌ HH CAPTCHA / BLOCK detected")
         else:
-            print("❌ PAGE NOT LOADED / NO RESULT LINKS")
+            print("❌ NO RESULT LINKS")
 
+        return []
+    except (NoSuchWindowException, InvalidSessionIdException, WebDriverException):
         return []
 
     links = safe_find_elements(driver, By.CSS_SELECTOR, "a[data-qa='serp-item__title']")
@@ -933,6 +986,11 @@ def get_search_result_urls(driver, wait) -> List[str]:
         if not href or "/vacancy/" not in href:
             continue
 
+        job_id = href.split("/vacancy/")[-1].split("?")[0].strip()
+
+        if not job_id.isdigit():
+            continue
+
         if href not in seen:
             seen.add(href)
             urls.append(href)
@@ -944,7 +1002,7 @@ def get_search_result_urls(driver, wait) -> List[str]:
 # PARSE VACANCY
 # ============================================================
 def parse_vacancy_page(driver, vacancy_url: str, keyword: str) -> Optional[dict]:
-    job_id = vacancy_url.split("/")[-1].split("?")[0]
+    job_id = vacancy_url.split("/vacancy/")[-1].split("?")[0].strip()
 
     if not is_valid_job_id(job_id):
         print(f"[SKIP] invalid job_id={job_id}")
@@ -966,34 +1024,34 @@ def parse_vacancy_page(driver, vacancy_url: str, keyword: str) -> Optional[dict]
     raw_skills = safe_text(driver, "//ul[contains(@class,'vacancy-skill-list')]").replace("\n", ",")
 
     if not raw_skills:
-        skill_elements = safe_find_elements(driver, By.CSS_SELECTOR, "[data-qa='bloko-tag__text']")
-
-        skills = []
-
-        for el in skill_elements:
-            try:
-                txt = el.text.strip()
-                if txt:
-                    skills.append(txt)
-            except Exception:
-                pass
-
+        skills = safe_css_texts(driver, "[data-qa='bloko-tag__text']")
         raw_skills = ",".join(skills)
 
-    raw_salary = safe_text(driver, "//span[contains(@data-qa,'vacancy-salary')]")
+    raw_salary = safe_text(driver, "//*[@data-qa='vacancy-salary']")
 
     if not raw_salary:
-        raw_salary = safe_text(driver, "//*[@data-qa='vacancy-salary']")
+        raw_salary = safe_text(driver, "//span[contains(@data-qa,'vacancy-salary')]")
 
-    raw_job_type = safe_text(driver, "//div[@data-qa='vacancy-working-hours']")
+    job_type_parts = []
 
-    if not raw_job_type:
-        raw_job_type = safe_text(driver, "//*[contains(@data-qa,'vacancy-view-employment-mode')]")
+    for xp in [
+        "//*[@data-qa='vacancy-experience']",
+        "//*[@data-qa='vacancy-view-employment-mode']",
+        "//*[@data-qa='vacancy-view-employment']",
+        "//*[@data-qa='vacancy-view-schedule']",
+        "//div[@data-qa='vacancy-working-hours']",
+    ]:
+        txt = safe_text(driver, xp)
 
-    raw_company = safe_text(driver, "//div[@data-qa='vacancy-company__details']")
+        if txt:
+            job_type_parts.append(txt)
+
+    raw_job_type = " | ".join(job_type_parts)
+
+    raw_company = safe_text(driver, "//*[@data-qa='vacancy-company-name']")
 
     if not raw_company:
-        raw_company = safe_text(driver, "//*[@data-qa='vacancy-company-name']")
+        raw_company = safe_text(driver, "//div[@data-qa='vacancy-company__details']")
 
     location = to_english(raw_location)
     country, country_code = extract_country_name_and_code_from_location(location)
@@ -1035,6 +1093,7 @@ def get_hh_vacancies(jobs_list):
     duplicates = 0
     parse_failed = 0
     pages_scanned = 0
+    scanned_vacancies = 0
     driver_restarts = 0
 
     try:
@@ -1048,7 +1107,8 @@ def get_hh_vacancies(jobs_list):
                 q = quote_plus(str(job))
                 search_url = f"{HH_BASE_SEARCH_URL}?text={q}&page={page}"
 
-                print(f"\n[SEARCH] job={job} page={page}")
+                print("\n==============================")
+                print(f"[SEARCH] job={job} page={page}")
                 print(f"[URL] {search_url}")
 
                 driver, wait, ok = safe_get(driver, wait, search_url)
@@ -1058,20 +1118,6 @@ def get_hh_vacancies(jobs_list):
                     driver, wait = restart_driver(driver)
                     driver_restarts += 1
                     break
-
-                body_ok = safe_wait_presence(
-                    driver,
-                    wait,
-                    (By.TAG_NAME, "body"),
-                    "search body",
-                    retries=2,
-                )
-
-                if not body_ok:
-                    print("[RESTART] Chrome died on search body wait")
-                    driver, wait = restart_driver(driver)
-                    driver_restarts += 1
-                    continue
 
                 time.sleep(HH_PAGE_SLEEP)
 
@@ -1084,9 +1130,9 @@ def get_hh_vacancies(jobs_list):
                 pages_scanned += 1
                 print(f"[FOUND] urls={len(urls)}")
 
-                for vacancy_url in urls:
+                for idx, vacancy_url in enumerate(urls, start=1):
                     try:
-                        print(f"[VACANCY] {vacancy_url}")
+                        print(f"\n[VACANCY] {idx}/{len(urls)} {vacancy_url}")
 
                         driver, wait, ok = safe_get(driver, wait, vacancy_url)
 
@@ -1102,12 +1148,12 @@ def get_hh_vacancies(jobs_list):
                             wait,
                             (By.XPATH, "//h1"),
                             "vacancy h1",
-                            retries=2,
+                            retries=1,
                         )
 
                         if not h1_ok:
                             parse_failed += 1
-                            print(f"[SKIP VACANCY] h1 not loaded or driver died: {vacancy_url}")
+                            print(f"[SKIP VACANCY] h1 not loaded: {vacancy_url}")
                             driver, wait = restart_driver(driver)
                             driver_restarts += 1
                             continue
@@ -1118,6 +1164,7 @@ def get_hh_vacancies(jobs_list):
                             parse_failed += 1
                             continue
 
+                        scanned_vacancies += 1
                         saved = save_to_database(cursor, data)
 
                         if saved:
@@ -1125,17 +1172,18 @@ def get_hh_vacancies(jobs_list):
                             print(
                                 f"✅ SAVED {data['job_id']} | "
                                 f"{data['job_title']} | "
-                                f"{data.get('country_code')}"
+                                f"salary={data['salary']} | "
+                                f"country={data.get('country_code')}"
                             )
                         else:
                             duplicates += 1
-                            print(f"⚠️ DUPLICATE {data['job_id']}")
+                            print(f"⚠️ DUPLICATE {data['job_id']} | {data['job_title']}")
 
                         time.sleep(HH_VACANCY_SLEEP)
 
                     except (NoSuchWindowException, InvalidSessionIdException, WebDriverException) as e:
                         parse_failed += 1
-                        print(f"[VACANCY DRIVER ERROR] {type(e).__name__}: {str(e)[:250]}")
+                        print(f"[VACANCY DRIVER ERROR] {type(e).__name__}: {str(e)[:200]}")
                         driver, wait = restart_driver(driver)
                         driver_restarts += 1
                         continue
@@ -1165,6 +1213,7 @@ def get_hh_vacancies(jobs_list):
         print(f"duplicates={duplicates}")
         print(f"parse_failed={parse_failed}")
         print(f"pages_scanned={pages_scanned}")
+        print(f"scanned_vacancies={scanned_vacancies}")
         print(f"driver_restarts={driver_restarts}")
 
 
@@ -1216,5 +1265,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
